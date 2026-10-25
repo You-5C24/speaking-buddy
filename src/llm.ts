@@ -9,6 +9,7 @@
  */
 
 import { z } from 'zod';
+import { norm } from './blocks.js';
 
 // ────────────────────────────────────────────────────────────
 // 契约
@@ -28,6 +29,8 @@ export const Flag = z.object({
 
 export const Reply = z.object({
   say: z.string().min(1).max(300),
+  /** 用户这句话，母语者会怎么说。和原句一样、或这一轮没有 flag，就省略 */
+  rewrite: z.string().max(200).nullable().optional(),
   flags: z.array(Flag).max(5),
 });
 
@@ -59,9 +62,21 @@ Rules:
 - No markdown, no lists, no emoji, no quotation marks around your reply.
 - "say" is spoken aloud. Write it the way a native speaker talks: contractions, natural rhythm.
 - No em dashes, no ellipsis used as a pause, no written-only punctuation.
+- The learner is A2. Prefer questions they can answer in one full sentence:
+  yes/no questions with a reason, A-or-B choices, "what kind of ___".
+  Never ask an open question that can be answered with one word.
+- Never ask "Anything else?" as your only question. It invites a one-word answer.
+- Words marked like [word? p=0.38] are ASR guesses. Do not build a flag whose
+  "said" is one of them, and do not "fix" a neighbouring word just because it
+  looks wrong next to a guess — the guess is probably what's wrong.
+- "rewrite": if the learner's sentence could be said more naturally, write THEIR
+  sentence the way a native speaker would. Same meaning, same length roughly.
+  Not your own reply. Omit if nothing to improve.
+- "why": one Chinese sentence naming the better form you just used
+  ("点单用 Could I get 比 I want 礼貌，这才是店员期待的句式"). Not a grammar lecture.
 
 Return ONLY a JSON object, nothing else:
-{"say": "<your spoken reply>", "flags": [{"said": "...", "better": "...", "type": "grammar|collocation|vocab|fluency", "severity": 1, "why": "<一句中文说明>"}]}
+{"say": "<your spoken reply>", "rewrite": "<their sentence, more naturally — omit the key if nothing to improve>", "flags": [{"said": "...", "better": "...", "type": "grammar|collocation|vocab|fluency", "severity": 1, "why": "<一句中文>"}]}
 
 flags = errors you noticed this turn. Use [] if none.
 - "type": "very" modifying a verb is a COLLOCATION problem, not grammar.
@@ -72,19 +87,107 @@ flags = errors you noticed this turn. Use [] if none.
 export function buildMessages(params: {
   persona: string;
   opening?: string;
+  goal?: string;
+  hiddenGoal?: string;
+  blocks?: { n: number; frame: string }[];
+  /** 这一轮的 beat。有就原样追加，不写成「可以的话」这种软要求 */
+  beatDirective?: string;
+  seedText?: string;
   history: Msg[];
   userText: string;
 }): Msg[] {
-  const system = `You are an English speaking partner.\n\nYour role: ${params.persona}\n\n${RULES}`;
+  let system = `You are an English speaking partner.\n\nYour role: ${params.persona}\n\n${RULES}`;
+
+  if (params.goal) system += `\n\nScenario goal: ${params.goal}`;
+  if (params.blocks?.length) {
+    system +=
+      `\n\nBlocks the learner prepared (they may use these):\n` +
+      params.blocks.map((b) => `${b.n}. ${b.frame}`).join('\n');
+  }
+  if (params.hiddenGoal) {
+    system += `\n\nYour own agenda this session (never state it, just steer): ${params.hiddenGoal}`;
+  }
+  if (params.seedText) system += `\n\nWhat they mentioned when starting: ${params.seedText}`;
+  if (params.beatDirective) system += `\n\nTHIS TURN ONLY: ${params.beatDirective}`;
 
   return [
     { role: 'system', content: system },
-    ...(params.opening
-      ? [{ role: 'assistant' as const, content: params.opening }]
-      : []),
+    ...(params.opening ? [{ role: 'assistant' as const, content: params.opening }] : []),
     ...params.history,
     { role: 'user', content: params.userText },
   ];
+}
+
+/** 标注线，不是判据。低于它的词内联标出来，其余不动（§5） */
+export const CONFIDENCE_MARK = 0.62;
+
+const edgePunct = (w: string) => w.replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, '');
+
+/**
+ * 第二层护栏：把低置信度标进转写，不另起一份名单。
+ * 词不够时退回原文，避免空串进 prompt。
+ */
+export function annotateTranscript(
+  words: { w: string; p: number }[],
+  fallbackText: string
+): string {
+  if (!words.length) return fallbackText;
+  return words
+    .map((word) => {
+      const token = edgePunct(word.w) || word.w;
+      if (word.p < CONFIDENCE_MARK) return `[${token}? p=${word.p.toFixed(2)}]`;
+      return token;
+    })
+    .join(' ');
+}
+
+export type CleanReply = {
+  say: string;
+  flags: Flag[];
+  rewrite?: string;
+};
+
+/**
+ * 第一层护栏 + rewrite 的两条代码校验。
+ * 不做 STOPWORDS 过滤：虚词恰恰是最常被幻觉出来的（§5 第三层）。
+ */
+export function sanitizeReply(
+  reply: Reply,
+  words: { w: string }[],
+  userText: string
+): CleanReply {
+  const source = words.length ? words.map((w) => w.w).join(' ') : userText;
+  const transcript = ` ${norm(source)} `;
+  const flags = reply.flags.filter((f) => {
+    const said = norm(f.said);
+    return said.length > 0 && transcript.includes(` ${said} `);
+  });
+
+  let rewrite = reply.rewrite?.trim() || undefined;
+  if (rewrite && norm(rewrite) === norm(userText)) rewrite = undefined;
+  if (flags.length === 0) rewrite = undefined;
+
+  return rewrite ? { say: reply.say, flags, rewrite } : { say: reply.say, flags };
+}
+
+const HELP_LINE = 'Try asking: "How do you say ___ in English?"';
+
+/**
+ * 转写基本是中文，或一整句每个词都低于标注线：这轮是求助，不建 flag。
+ * 短答不算。这场 “Black” 只有一个词、p=0.54，是在回答 Black or with milk，
+ * 不该回 How do you say。那种情况交给模型，并在转写里标出置信度。
+ */
+export function isHelpSeeking(text: string, words: { p: number }[]): boolean {
+  const letters = [...text].filter((c) => /\p{L}/u.test(c));
+  const nonAscii = letters.filter((c) => (c.codePointAt(0) ?? 0) > 127);
+  if (nonAscii.length >= 2) return true;
+  if (letters.length > 0 && nonAscii.length / letters.length >= 0.25) return true;
+  if (words.length >= 4 && words.every((w) => w.p < CONFIDENCE_MARK)) return true;
+  return false;
+}
+
+export function helpSeekingReply(): CleanReply {
+  return { say: HELP_LINE, flags: [] };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -146,6 +249,7 @@ async function callChat(params: {
   jsonMode: boolean;
   signal?: AbortSignal;
   timeoutMs: number;
+  extra?: Record<string, unknown>;
 }): Promise<{ content: string; usage: OpenAIResponse['usage']; ms: number }> {
   const t0 = Date.now();
   const ac = new AbortController();
@@ -164,6 +268,7 @@ async function callChat(params: {
         model: params.model,
         messages: params.messages,
         ...(params.jsonMode ? { response_format: { type: 'json_object' } } : {}),
+        ...params.extra,
       }),
       signal: ac.signal,
     });
@@ -197,6 +302,8 @@ export type ProviderConfig = {
   /** 是否用 response_format: json_object。中转站不可靠时可关掉。 */
   jsonMode?: boolean;
   timeoutMs?: number;
+  /** 合并进请求体。kimi-k2.6 用它关思考。 */
+  extra?: Record<string, unknown>;
 };
 
 export function makeChatModel(cfg: ProviderConfig): ChatModel {
@@ -211,14 +318,15 @@ export function makeChatModel(cfg: ProviderConfig): ChatModel {
         messages,
         jsonMode: cfg.jsonMode ?? true,
         timeoutMs: cfg.timeoutMs ?? 20_000,
+        ...(cfg.extra ? { extra: cfg.extra } : {}),
         ...(opts?.signal ? { signal: opts.signal } : {}),
       });
 
       const reasoning = usage?.completion_tokens_details?.reasoning_tokens ?? 0;
-      if (reasoning > 0) {
-        // 不走 throw：慢总比没有好，但要留下证据
+      // k2.6 关掉思考后仍会报 1。只有重新想起来的时候才值得记。
+      if (reasoning >= 80) {
         console.warn(
-          `[llm] ${cfg.id} 产生 ${reasoning} reasoning tokens（${ms}ms），该模型不适合实时对话`
+          `[llm] ${cfg.model} 产生 ${reasoning} reasoning tokens（${ms}ms），正式轮会超过 5 秒`
         );
       }
 
@@ -244,12 +352,16 @@ export function makeChatModel(cfg: ProviderConfig): ChatModel {
 
 export function moonshot(env = process.env): ChatModel {
   const key = requireEnv(env, 'MOONSHOT_API_KEY');
+  // highspeed 关不掉思考。prompt 变长后推理 token 到过 1836，单轮模型 9.5 秒。
+  // k2.6 可以 thinking.type=disabled。实测正式轮 0.5–1.4 秒，推理 token 为 1。
+  const model = env.MOONSHOT_MODEL ?? 'kimi-k2.6';
   return makeChatModel({
     id: 'moonshot',
-    label: 'Kimi k2.7 highspeed',
+    label: model,
     baseUrl: 'https://api.moonshot.cn/v1',
     apiKey: key,
-    model: env.MOONSHOT_MODEL ?? 'kimi-k2.7-code-highspeed',
+    model,
+    ...(model === 'kimi-k2.6' ? { extra: { thinking: { type: 'disabled' } } } : {}),
   });
 }
 

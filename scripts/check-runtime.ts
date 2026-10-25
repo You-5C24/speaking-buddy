@@ -1,0 +1,462 @@
+/**
+ * 运行时纯函数自检：prompt、护栏、热身模板、复盘卡片、选题流程、meta.scenarioId。
+ * 不联网、不碰飞书。
+ */
+
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { isSeedText, nextAction } from '../src/flow.js';
+import {
+  annotateTranscript,
+  buildMessages,
+  isHelpSeeking,
+  sanitizeReply,
+  type Reply,
+} from '../src/llm.js';
+import {
+  createSession,
+  nextTurnIndex,
+  readMeta,
+  restoreOpenSessions,
+  turnIndexFromNames,
+  type Session,
+  type Turn,
+} from '../src/pipeline.js';
+import { buildReview } from '../src/review.js';
+import { loadAll, resolveScenario } from '../src/scenarios.js';
+import { activeBeatDirective } from '../src/beats.js';
+import { plainTextFromPost } from '../src/lark.js';
+import { anchorId, lookupKeys, primaryKey, replyInThread } from '../src/topic.js';
+import { buildWarmupLine } from '../src/warmup.js';
+
+let failed = 0;
+const eq = (name: string, actual: unknown, expected: unknown) => {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a === e) console.log(`  ✅ ${name}`);
+  else {
+    failed++;
+    console.log(`  ❌ ${name}\n     实际 ${a}\n     期望 ${e}`);
+  }
+};
+const ok = (name: string, cond: boolean) => eq(name, cond, true);
+
+const flag = (said: string, severity = 2): Reply['flags'][number] => ({
+  said,
+  better: 'x',
+  type: 'collocation',
+  severity,
+  why: '因为',
+});
+
+console.log('\nannotateTranscript()');
+const payWords = [
+  { w: 'What', p: 0.9 },
+  { w: 'is', p: 0.9 },
+  { w: 'the', p: 0.9 },
+  { w: 'main', p: 0.46 },
+  { w: 'pay', p: 0.38 },
+  { w: 'at', p: 0.9 },
+  { w: 'the', p: 0.9 },
+  { w: 'register', p: 0.9 },
+];
+eq(
+  '低置信度内联，高置信度原样',
+  annotateTranscript(payWords, ''),
+  'What is the [main? p=0.46] [pay? p=0.38] at the register'
+);
+eq('没有词就退回原文', annotateTranscript([], 'hello'), 'hello');
+
+console.log('\nsanitizeReply()');
+const asWords = [
+  { w: 'Could' },
+  { w: 'I' },
+  { w: 'get' },
+  { w: 'a' },
+  { w: 'medium' },
+  { w: 'as' },
+  { w: 'Americano' },
+];
+const user = 'Could I get a medium as Americano';
+const droppedMean = sanitizeReply(
+  {
+    say: 'A medium Americano?',
+    rewrite: 'Could I get a medium Americano?',
+    flags: [flag('mean'), flag('as', 1)],
+  },
+  asWords,
+  user
+);
+eq('编出来的 mean 被丢掉', droppedMean.flags.map((f) => f.said), ['as']);
+ok('as 还在转写里，第一层不删它', droppedMean.flags.some((f) => f.said === 'as'));
+ok('还剩 flag 时改写留下', droppedMean.rewrite === 'Could I get a medium Americano?');
+
+const same = sanitizeReply(
+  { say: 'Got it.', rewrite: 'Could I get a medium as Americano', flags: [flag('as')] },
+  asWords,
+  user
+);
+ok('和原句一样的 rewrite 丢掉', same.rewrite == null);
+
+const noFlag = sanitizeReply(
+  { say: 'Got it. That is $3.25', rewrite: 'Could I get a medium Americano?', flags: [flag('mean')] },
+  asWords,
+  user
+);
+ok('flag 被滤光之后 rewrite 也丢掉', noFlag.flags.length === 0 && noFlag.rewrite == null);
+
+const neighbor = sanitizeReply(
+  {
+    say: 'The main pay?',
+    flags: [flag('main')],
+  },
+  payWords,
+  'What is the main pay at the register'
+);
+eq('main 是转写里的词，第一层留着', neighbor.flags.map((f) => f.said), ['main']);
+
+console.log('\nisHelpSeeking()');
+ok('中文是求助', isHelpSeeking('拿铁怎么说', []));
+ok(
+  '一整句都低于标注线才是求助',
+  isHelpSeeking('what is the main pay', [
+    { p: 0.4 },
+    { p: 0.4 },
+    { p: 0.46 },
+    { p: 0.38 },
+  ])
+);
+ok('单个低置信度英文词不是求助', !isHelpSeeking('Black', [{ p: 0.538 }]));
+ok('正常英文不是求助', !isHelpSeeking('Could I get a latte', [{ p: 0.9 }, { p: 0.4 }]));
+
+console.log('\nbuildMessages()');
+const beat = buildMessages({
+  persona: 'a barista',
+  goal: '点一杯咖啡',
+  blocks: [{ n: 1, frame: 'Could I get a ___ ?' }],
+  beatDirective: 'This turn, mishear one detail of their order.',
+  history: [],
+  userText: 'A latte.',
+}).find((m) => m.role === 'system')!.content;
+ok('goal 进 prompt', beat.includes('Scenario goal: 点一杯咖啡'));
+ok('块进 prompt', beat.includes('1. Could I get a ___ ?'));
+ok('beat 是硬注入', beat.includes('THIS TURN ONLY: This turn, mishear one detail of their order.'));
+ok('不写成软要求', !beat.includes('if you like') && !beat.includes('you might'));
+
+const freePrompt = buildMessages({
+  persona: 'a friend',
+  hiddenGoal: '讲完一件完整的小事',
+  seedText: '今天去爬山了',
+  history: [],
+  userText: 'I went hiking.',
+}).find((m) => m.role === 'system')!.content;
+ok('hiddenGoal 进 prompt 且要求别说破', freePrompt.includes('never state it') && freePrompt.includes('讲完一件完整的小事'));
+ok('没有 goal 就不写 Scenario goal', !freePrompt.includes('Scenario goal:'));
+ok('种子进 prompt', freePrompt.includes('What they mentioned when starting: 今天去爬山了'));
+
+const quiet = buildMessages({
+  persona: 'a barista',
+  history: [],
+  userText: 'Hi',
+}).find((m) => m.role === 'system')!.content;
+ok('没 beat 就不写 THIS TURN ONLY', !quiet.includes('THIS TURN ONLY'));
+
+console.log('\ntopic()');
+const chat = 'oc_g';
+eq(
+  '单聊键退化成 chatId',
+  primaryKey({ chatId: chat, messageId: 'om_1', chatType: 'p2p' }),
+  `${chat}:${chat}`
+);
+ok('单聊不进话题', !replyInThread('p2p'));
+ok('群回复落在话题里', replyInThread('group'));
+const root = { chatId: chat, messageId: 'om_root', chatType: 'group' };
+eq('话题根消息先挂在 messageId 上', primaryKey(root), `${chat}:om_root`);
+eq('根消息的锚点是它自己', anchorId(root), 'om_root');
+const follow = {
+  chatId: chat,
+  messageId: 'om_2',
+  chatType: 'group',
+  threadId: 'omt_1',
+  rootId: 'om_root',
+};
+eq('下一条用 threadId 做主键', primaryKey(follow), `${chat}:omt_1`);
+eq(
+  '下一条仍能顺着 rootId 找到根消息登记的那场',
+  lookupKeys(follow).includes(`${chat}:om_root`) && lookupKeys(follow).includes(`${chat}:omt_1`),
+  true
+);
+const other = { chatId: chat, messageId: 'om_other', chatType: 'group', threadId: 'omt_2' };
+ok('两个话题不是同一个键', primaryKey(follow) !== primaryKey(other));
+eq('有 root 时锚点是根消息', anchorId(follow), 'om_root');
+eq(
+  '话题富文本里的 1 能读出来',
+  plainTextFromPost({
+    zh_cn: { title: '', content: [[{ tag: 'text', text: '1' }]] },
+  }),
+  '1'
+);
+eq(
+  '富文本里的 @ 不算正文',
+  plainTextFromPost({
+    content: [[{ tag: 'at', user_name: '口语搭子' }, { tag: 'text', text: ' 点单' }]],
+  }),
+  '点单'
+);
+
+console.log('\nbuildWarmupLine()');
+const opening = 'Hi! What can I get for you today?';
+eq(
+  '抽出实词再接开场',
+  buildWarmupLine({
+    words: [
+      { w: 'Could', p: 0.9 },
+      { w: 'I', p: 0.9 },
+      { w: 'get', p: 0.8 },
+      { w: 'a', p: 0.9 },
+      { w: 'medium', p: 0.7 },
+      { w: 'latte', p: 0.95 },
+    ],
+    text: 'Could I get a medium latte',
+    opening,
+  }),
+  `Nice, a medium latte. Okay — ${opening}`
+);
+eq(
+  '抽不出来就只说开场',
+  buildWarmupLine({ words: [{ w: 'No', p: 0.9 }], text: 'No', opening }),
+  `Okay — ${opening}`
+);
+
+console.log('\nnextAction()');
+eq('打 1 直接开场', nextAction(null, { kind: 'text', alias: true, endCommand: false }), 'start');
+eq('打 hi 出菜单', nextAction(null, { kind: 'text', alias: false, endCommand: false }), 'menu');
+eq('单聊先发语音出菜单', nextAction(null, { kind: 'audio', alias: false, endCommand: false }), 'audio-menu');
+eq(
+  '菜单里回 2 选场景',
+  nextAction({ ended: false, hasScenario: false, warmupDone: false }, { kind: 'text', alias: true, endCommand: false }),
+  'choose'
+);
+eq(
+  '热身前的文字不推进',
+  nextAction({ ended: false, hasScenario: true, warmupDone: false }, { kind: 'text', alias: false, endCommand: false }),
+  'need-voice'
+);
+eq(
+  '热身是语音',
+  nextAction({ ended: false, hasScenario: true, warmupDone: false }, { kind: 'audio', alias: false, endCommand: false }),
+  'warmup'
+);
+eq(
+  '热身之后才是正式轮',
+  nextAction({ ended: false, hasScenario: true, warmupDone: true }, { kind: 'audio', alias: false, endCommand: false }),
+  'turn'
+);
+eq(
+  '结束后不自动重开',
+  nextAction({ ended: true, hasScenario: true, warmupDone: true }, { kind: 'audio', alias: false, endCommand: false }),
+  'audio-ended'
+);
+ok('今天去爬山了是种子', isSeedText('今天去爬山了'));
+ok('练口语太短，不是种子', !isSeedText('练口语'));
+ok('hi 不是种子', !isSeedText('hi'));
+eq(
+  '一段话直接进自由聊',
+  nextAction(null, { kind: 'text', alias: false, endCommand: false, seed: true }),
+  'start-seed'
+);
+eq(
+  '菜单发出去之后长句仍然重发菜单',
+  nextAction(
+    { ended: false, hasScenario: false, warmupDone: false },
+    { kind: 'text', alias: false, endCommand: false, seed: true }
+  ),
+  'repeat-menu'
+);
+eq('轮次号跳过热身目录', turnIndexFromNames(['000-warmup', '001', '002']), 3);
+eq('缺号不回填', turnIndexFromNames(['001', '003']), 4);
+eq(
+  '结束后打短名才开新的一场',
+  nextAction({ ended: true, hasScenario: true, warmupDone: true }, { kind: 'text', alias: true, endCommand: false }),
+  'restart'
+);
+
+function fakeTurn(index: number, userText: string, reply: Partial<Reply> & { say: string }): Turn {
+  return {
+    index,
+    userText,
+    words: [
+      { w: 'Could', start: 0, end: 0.3, p: 0.9 },
+      { w: 'I', start: 0.3, end: 0.4, p: 0.9 },
+    ],
+    reply: { flags: [], ...reply },
+  };
+}
+
+console.log('\nbuildReview()');
+const { scenarios } = await loadAll();
+const cafe = resolveScenario(scenarios.find((s) => s.id === 'cafe-1')!);
+const free = resolveScenario(scenarios.find((s) => s.id === 'free-1')!);
+const askBeat = cafe.beats.find((b) => b.atTurn === 3)!;
+const mishearBeat = cafe.beats.find((b) => b.atTurn === 2)!;
+ok(
+  '还没说过 for here / to go，第 3 轮仍然要问',
+  activeBeatDirective(askBeat, cafe.blocks, ['Could I get a medium latte'])!.startsWith('Ask whether')
+);
+ok(
+  '已经说过 to go，第 3 轮不再问',
+  activeBeatDirective(askBeat, cafe.blocks, ['Could I get a latte', 'to go'])!.includes('Do not ask')
+);
+ok(
+  '听错那一轮不因为点过单就被取消',
+  activeBeatDirective(mishearBeat, cafe.blocks, ['Could I get a latte', 'to go'])!.includes('mishear')
+);
+const mediumOrder = activeBeatDirective(mishearBeat, cafe.blocks, [
+  'Could I get a medium Americano?',
+  'to go',
+]);
+ok(
+  '听错点名把 medium 换成 large',
+  !!mediumOrder?.includes('Change only the word "medium" to "large"')
+);
+const largeOrder = activeBeatDirective(mishearBeat, cafe.blocks, [
+  'Could I get a large iced coffee?',
+]);
+ok(
+  '听错优先换杯型，不换冷热',
+  !!largeOrder?.includes('Change only the word "large" to "medium"') &&
+    !largeOrder.includes('"iced"')
+);
+ok(
+  '问 for here 的指令不追加换词',
+  !activeBeatDirective(askBeat, cafe.blocks, ['Could I get a medium latte'])!.includes('Change only')
+);
+
+const dir = await mkdtemp(join(tmpdir(), 'sb-review-'));
+try {
+  const session = await createSession('oc_test', cafe, { dir, listTitle: '点单 · 店员会听错一次' });
+  const meta = (await readMeta(dir)) as { scenarioId: string | null };
+  eq('meta.scenarioId 是 cafe-1', meta.scenarioId, 'cafe-1');
+
+  session.warmup = fakeTurn(0, 'Could I get a medium latte', { say: 'Nice, a medium latte.' });
+  session.turns = [
+    fakeTurn(1, 'No.', {
+      say: "Got it. That's $3.25",
+      flags: [{ said: 'No', better: 'No thanks', type: 'fluency', severity: 1, why: '太短' }],
+    }),
+  ];
+  const card = buildReview(session);
+  ok('1 号块算上热身', card.includes('1 ✓'));
+  ok('还没问到的块是 —', card.includes('2 —') && card.includes('3 —'));
+  ok('不把没轮到写成 ✗', !card.includes('2 ✗') && !card.includes('3 ✗'));
+  ok('更自然不拿 bot 的台词充数', !card.includes("Got it. That's $3.25") && !card.includes('更自然'));
+  ok('只有 1 级 flag 时不单列', !card.includes('最该改的一点'));
+  ok('卡片不出现隐藏目标字段名', !card.includes('hiddenGoal'));
+
+  const withRewrite = await createSession('oc_test', cafe, {
+    dir: join(dir, 'rw'),
+    listTitle: '点单 · 店员会听错一次',
+  });
+  withRewrite.warmupDone = true;
+  withRewrite.turns = [
+    fakeTurn(1, 'I want a medium Americano', {
+      say: 'One medium Americano, for here?',
+      rewrite: 'Could I get a medium Americano?',
+      flags: [{ said: 'I want', better: 'Could I get', type: 'collocation', severity: 2, why: '点单用 Could I get 更礼貌' }],
+    }),
+    fakeTurn(2, 'Yes', { say: 'For here?' }),
+    fakeTurn(3, 'For here please', { say: 'Got it.' }),
+    fakeTurn(4, 'Thanks', { say: 'Sure.' }),
+  ];
+  const card2 = buildReview(withRewrite);
+  ok('更自然是用户那句的改写', card2.includes('更自然：Could I get a medium Americano?'));
+  ok('severity>=2 才单列', card2.includes('最该改的一点') && card2.includes('Could I get'));
+  ok('问过了还没用 3 号块是 ✗', card2.includes('3 ✗'));
+
+  const freeSession: Session = await createSession('oc_test', free, {
+    dir: join(dir, 'free'),
+    listTitle: '自由聊 · 随便说，我接住',
+  });
+  freeSession.turns = [
+    fakeTurn(1, 'I went hiking', {
+      say: 'How long did you walk?',
+      rewrite: 'I went hiking today.',
+      flags: [flag('hiking')],
+    }),
+  ];
+  const freeCard = buildReview(freeSession);
+  ok('rewrite 卡片不显示块使用', !freeCard.includes('三句用了') && !freeCard.includes('1 ✗'));
+  ok('rewrite 卡片计数', freeCard.includes('说得更自然 1 处'));
+  ok('隐藏目标不上卡片', free.hiddenGoal ? !freeCard.includes(free.hiddenGoal) : true);
+
+  const freeMeta = (await readMeta(join(dir, 'free'))) as { scenarioId: string | null };
+  eq('meta.scenarioId 能切到 free-1', freeMeta.scenarioId, 'free-1');
+} finally {
+  await rm(dir, { recursive: true, force: true });
+}
+
+console.log('\nrestoreOpenSessions()');
+const scratch = await mkdtemp(join(tmpdir(), 'sb-restore-'));
+try {
+  const openDir = join(scratch, '2026-10-25', '20261025-0000-open');
+  await mkdir(join(openDir, 'turns', '001'), { recursive: true });
+  await mkdir(join(openDir, 'turns', '000-warmup'), { recursive: true });
+  const meta = {
+    sessionId: '20261025-0000-open',
+    chatId: 'oc_r',
+    threadId: 'omt_r',
+    rootId: 'om_r',
+    sessionKey: 'oc_r:omt_r',
+    anchorMessageId: 'om_r',
+    rootText: '1',
+    scenarioId: 'cafe-1',
+    scenarioTitle: '点单，店员听错了一次',
+    seedText: null,
+    startedAt: '2026-10-25T00:00:00.000Z',
+    endedAt: null,
+    endReason: null,
+    turnCount: 1,
+    warmupDone: true,
+    menuSent: false,
+    blockUsage: null,
+  };
+  await writeFile(join(openDir, 'meta.json'), JSON.stringify(meta));
+  await writeFile(
+    join(openDir, 'turns', '000-warmup', 'asr.json'),
+    JSON.stringify({ text: 'Could I get a medium latte', words: [] })
+  );
+  await writeFile(
+    join(openDir, 'turns', '000-warmup', 'llm.json'),
+    JSON.stringify({ say: 'Nice, a medium latte.', flags: [] })
+  );
+  await writeFile(
+    join(openDir, 'turns', '001', 'asr.json'),
+    JSON.stringify({ text: 'to go', words: [{ w: 'to', start: 0, end: 0.2, p: 0.9 }] })
+  );
+  await writeFile(
+    join(openDir, 'turns', '001', 'llm.json'),
+    JSON.stringify({ say: 'Large latte to go.', flags: [] })
+  );
+  const endedDir = join(scratch, '2026-10-25', '20261025-0000-end');
+  await mkdir(endedDir, { recursive: true });
+  await writeFile(join(endedDir, 'meta.json'), JSON.stringify({ ...meta, sessionId: 'ended', endedAt: '2026-10-25T01:00:00.000Z' }));
+  await writeFile(join(scratch, '2026-10-25', 'junk.json'), '{');
+  const oldDir = join(scratch, '2026-10-25', 'old');
+  await mkdir(oldDir, { recursive: true });
+  await writeFile(join(oldDir, 'meta.json'), JSON.stringify({ sessionId: 'old', chatId: 'oc_r' }));
+
+  const found = await restoreOpenSessions(scratch, (id) =>
+    id === 'cafe-1' ? { scenario: cafe, listTitle: '点单 · 店员会听错一次' } : null
+  );
+  eq('只恢复未结束的一场', found.map((s) => s.id), ['20261025-0000-open']);
+  eq('轮次从盘上读回来', found[0]?.turns.map((t) => t.userText), ['to go']);
+  eq('热身也读回来', found[0]?.warmup?.userText, 'Could I get a medium latte');
+  eq('场景接回来', found[0]?.scenario?.id, 'cafe-1');
+  eq('空目录的下一轮是 2', await nextTurnIndex(openDir), 2);
+} finally {
+  await rm(scratch, { recursive: true, force: true });
+}
+
+console.log(failed ? `\n❌ ${failed} 条失败\n` : '\n✅ 全部通过\n');
+process.exit(failed ? 1 : 0);

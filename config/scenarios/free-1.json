@@ -1,0 +1,34 @@
+{
+  "id": "free-1",
+  "title": "自由聊，随便说",
+  "level": "A2",
+  "hiddenGoal": "讲完一件完整的小事（谁、什么时候、发生了什么），并在中途至少反问一次",
+  "persona": "a patient friend who is genuinely curious. You speak plainly and never lecture.",
+  "opening": "Hey. What's been going on today?",
+  "voice": "English_Gentle-voiced_man",
+  "cardStyle": "rewrite",
+  "source": "handwritten",
+
+  "blocks": [
+    {
+      "n": 1,
+      "frame": "How do you say ___ in English?",
+      "example": "How do you say 拿铁 in English?",
+      "alternatives": []
+    },
+    {
+      "n": 2,
+      "frame": "What's another word for ___ ?",
+      "example": "What's another word for tired?",
+      "alternatives": ["What is another word for ___ ?"]
+    },
+    {
+      "n": 3,
+      "frame": "Sorry, can you say that again?",
+      "example": "Sorry, can you say that again?",
+      "alternatives": ["Can you repeat that?"]
+    }
+  ],
+
+  "beats": []
+}

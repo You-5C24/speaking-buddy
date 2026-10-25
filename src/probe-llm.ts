@@ -60,7 +60,8 @@ async function runModel(label: string, model: ReturnType<typeof moonshot>) {
 const which = process.argv[2] ?? 'moonshot';
 
 if (which === 'both' || which === 'moonshot') {
-  await runModel('Moonshot · kimi-k2.7-code-highspeed', moonshot());
+  const model = moonshot();
+  await runModel(`Moonshot · ${model.label}`, model);
 }
 
 if (which === 'both' || which === 'gemini') {

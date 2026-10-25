@@ -1,0 +1,50 @@
+{
+  "id": "cafe-1",
+  "title": "点单，店员听错了一次",
+  "level": "A2",
+  "goal": "点一杯咖啡，并在店员听错后用一句澄清",
+  "persona": "a friendly but brisk barista at a coffee shop. You are mid-shift, the queue is long, and you speak in short sentences.",
+  "opening": "Hi! What can I get for you today?",
+  "voice": "English_Gentle-voiced_man",
+  "cardStyle": "blocks",
+  "source": "handwritten",
+
+  "blocks": [
+    {
+      "n": 1,
+      "frame": "Could I get a ___ ?",
+      "example": "Could I get a medium latte?",
+      "swaps": ["medium Americano", "large iced coffee", "oat milk latte"],
+      "alternatives": ["Can I get a ___ ?", "I'd like a ___ .", "I'll have a ___ ."]
+    },
+    {
+      "n": 2,
+      "frame": "For here, please.",
+      "example": "For here, please.",
+      "swaps": ["To go, please."],
+      "alternatives": ["To go, please."]
+    },
+    {
+      "n": 3,
+      "frame": "Sorry, I meant ___ .",
+      "example": "Sorry, I meant oat milk, not soy.",
+      "swaps": ["Sorry, I meant a medium.", "Sorry, I meant iced."],
+      "alternatives": ["Sorry, I wanted ___ ."]
+    }
+  ],
+
+  "beats": [
+    {
+      "atTurn": 2,
+      "forBlock": 3,
+      "need": "店员听错一次，用户澄清（且只发生一次）",
+      "directive": "This turn, mishear one detail of their order — swap the milk, the size, or the temperature. Say the wrong version back as if you were writing it down. Do not apologize yet."
+    },
+    {
+      "atTurn": 3,
+      "forBlock": 2,
+      "need": "确认在这里喝还是带走",
+      "directive": "Ask whether it's for here or to go."
+    }
+  ]
+}

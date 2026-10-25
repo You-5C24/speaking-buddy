@@ -1,11 +1,13 @@
 /**
  * 复盘：从攒下来的 turns 里挑 3 句，拼成一张卡片。
  * 不重新调 LLM —— 复盘是攒数据，不是重新推导。
+ * 「更自然」只取 rewrite。块统计含热身轮。
  */
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Session, Turn } from './pipeline.js';
+import { assignNotReached, computeBlockUsage, type BlockUsage } from './blocks.js';
+import { metrics, type Session, type Turn } from './pipeline.js';
 
 const MAX_SENTENCES = 3;
 
@@ -32,43 +34,63 @@ export function pickSentences(session: Session, n = MAX_SENTENCES): Turn[] {
   return picked.sort((a, b) => a.index - b.index);
 }
 
-function aggregateMetrics(session: Session) {
-  const per = session.turns
-    .map((t) => t.reply && t.userText ? t : null)
-    .filter(Boolean);
+export type AggregateMetrics = {
+  wpm: number | null;
+  longPausePerMin: number | null;
+  fillerPer100w: number | null;
+};
 
-  const m = session.turns
-    .flatMap((t) => {
-      const w = t.words;
-      if (w.length < 2) return [];
-      const first = w[0]!;
-      const last = w[w.length - 1]!;
-      const speechMs = (last.end - first.start) * 1000;
-      if (speechMs <= 0) return [];
-      let longPauses = 0;
-      for (let i = 1; i < w.length; i++) {
-        if ((w[i]!.start - w[i - 1]!.end) * 1000 > 1500) longPauses++;
-      }
-      const fillers = w.filter((x) => /^(um|uh|erm|hmm|er|ah)$/i.test(x.w)).length;
-      return [{ speechMs, words: w.length, longPauses, fillers }];
-    });
+/**
+ * 累加每轮 `metrics()` 的计数，不另抄一套公式。
+ * 间隙检测结构上打不出停顿（whisper 把静音吞进词长），0 记成 null，卡片显示 —。
+ */
+export function aggregateMetrics(session: Session): AggregateMetrics {
+  const parts = session.turns.flatMap((t) => {
+    const m = metrics(t.words);
+    return m ? [m] : [];
+  });
 
-  const speechMs = m.reduce((s, x) => s + x.speechMs, 0);
-  const words = m.reduce((s, x) => s + x.words, 0);
-  const longPauses = m.reduce((s, x) => s + x.longPauses, 0);
-  const fillers = m.reduce((s, x) => s + x.fillers, 0);
+  const speechMs = parts.reduce((s, x) => s + x.speechMs, 0);
+  const words = parts.reduce((s, x) => s + x.words, 0);
+  const longPauses = parts.reduce((s, x) => s + x.longPauses, 0);
+  const fillers = parts.reduce((s, x) => s + x.fillers, 0);
 
   if (speechMs <= 0 || words === 0) {
-    return { wpm: 0, longPausePerMin: 0, fillerPer100w: 0 };
+    return { wpm: null, longPausePerMin: null, fillerPer100w: null };
   }
 
   const minutes = speechMs / 60000;
   return {
     wpm: Math.round(words / minutes),
-    longPausePerMin: Number((longPauses / minutes).toFixed(1)),
+    longPausePerMin: longPauses === 0 ? null : Number((longPauses / minutes).toFixed(1)),
     fillerPer100w: Number(((fillers / words) * 100).toFixed(1)),
-    _unused: per.length,
   };
+}
+
+export function blockUsageFor(session: Session): Record<string, BlockUsage> | null {
+  if (!session.scenario) return null;
+  const texts = [
+    ...(session.warmup ? [session.warmup.userText] : []),
+    ...session.turns.map((t) => t.userText),
+  ];
+  const raw = computeBlockUsage(session.scenario.blocks, texts);
+  return assignNotReached(raw, session.scenario.beats, session.turns.length);
+}
+
+const CN = ['零', '一', '两', '三', '四', '五', '六', '七', '八', '九'];
+
+function blockUsageLine(blocks: { n: number }[], usage: Record<string, BlockUsage>): string {
+  const sorted = [...blocks].sort((a, b) => a.n - b.n);
+  const used = sorted.filter((b) => usage[String(b.n)] === 'used').length;
+  const marks = sorted
+    .map((b) => {
+      const state = usage[String(b.n)] ?? 'unused';
+      const mark = state === 'used' ? '✓' : state === 'not_reached' ? '—' : '✗';
+      return `${b.n} ${mark}`;
+    })
+    .join('  ');
+  const n = CN[used] ?? String(used);
+  return `三句用了${n}句：${marks}`;
 }
 
 export type Postmortem = {
@@ -76,25 +98,28 @@ export type Postmortem = {
   scenarioId: string;
   endReason: string;
   turnCount: number;
-  metrics: ReturnType<typeof aggregateMetrics>;
+  metrics: AggregateMetrics;
+  blockUsage: Record<string, BlockUsage> | null;
+  rewriteCount: number;
   topIssue: { said: string; better: string; why?: string; turn: number } | null;
   sentences: {
     turn: number;
     said: string;
     expression: string;
-    natural: string;
+    natural: string | null;
     audioUser: string;
   }[];
   stalls: { turn: number; signal: string; pauseMs: number }[];
 };
 
 export function buildPostmortem(session: Session, endReason = 'user_end'): Postmortem {
+  if (!session.scenario) throw new Error('还没选场景，没有复盘');
   const picked = pickSentences(session);
 
   const allFlags = session.turns.flatMap((t) =>
     t.reply.flags.map((f) => ({ ...f, turn: t.index }))
   );
-  const top = [...allFlags].sort((a, b) => b.severity - a.severity)[0];
+  const top = allFlags.filter((f) => f.severity >= 2).sort((a, b) => b.severity - a.severity)[0];
 
   const stalls = session.turns.flatMap((t) => {
     const w = t.words;
@@ -106,12 +131,18 @@ export function buildPostmortem(session: Session, endReason = 'user_end'): Postm
     return out;
   });
 
+  const blockUsage = blockUsageFor(session);
+  session.blockUsage = blockUsage;
+  const rewriteCount = session.turns.filter((t) => t.reply.rewrite?.trim()).length;
+
   return {
     sessionId: session.id,
     scenarioId: session.scenario.id,
     endReason,
     turnCount: session.turns.length,
     metrics: aggregateMetrics(session),
+    blockUsage,
+    rewriteCount,
     topIssue: top
       ? {
           said: top.said,
@@ -122,28 +153,44 @@ export function buildPostmortem(session: Session, endReason = 'user_end'): Postm
       : null,
     sentences: picked.map((t) => {
       const f = t.reply.flags[0];
+      const audio =
+        t.index === 0
+          ? 'turns/000-warmup/user.opus'
+          : `turns/${String(t.index).padStart(3, '0')}/user.opus`;
       return {
         turn: t.index,
         said: t.userText,
         expression: f
           ? `${f.said} → ${f.better}${f.why ? `（${f.why}）` : ''}`
           : '这一句没有影响理解的问题',
-        natural: t.reply.say,
-        audioUser: `turns/${String(t.index).padStart(3, '0')}/user.opus`,
+        natural: t.reply.rewrite?.trim() || null,
+        audioUser: audio,
       };
     }),
     stalls,
   };
 }
 
+function wpmLabel(wpm: number | null): string {
+  return wpm == null ? '—' : `${wpm} wpm`;
+}
+
 /** 生成发到飞书的卡片文本。一屏能看完是硬要求。 */
 export function buildReview(session: Session, endReason = 'user_end'): string {
   const pm = buildPostmortem(session, endReason);
+  const scenario = session.scenario;
+  if (!scenario) throw new Error('还没选场景，没有复盘');
 
+  const title = session.listTitle || scenario.title;
+  const speed = wpmLabel(pm.metrics.wpm);
   const lines: string[] = [];
-  lines.push(
-    `🎯 ${session.scenario.title} · ${pm.turnCount} 轮 · 语速 ${pm.metrics.wpm} wpm`
-  );
+  lines.push(`🎯 ${title} · ${pm.turnCount} 轮 · 语速 ${speed}`);
+
+  if (scenario.cardStyle === 'rewrite') {
+    lines.push(`说得更自然 ${pm.rewriteCount} 处 · ${pm.turnCount} 轮 · 语速 ${speed}`);
+  } else if (pm.blockUsage) {
+    lines.push(blockUsageLine(scenario.blocks, pm.blockUsage));
+  }
   lines.push('');
 
   if (pm.topIssue) {
@@ -163,28 +210,22 @@ export function buildReview(session: Session, endReason = 'user_end'): string {
     lines.push('');
     lines.push(`第 ${s.turn} 轮`);
     lines.push(`  你说：${s.said}`);
-    lines.push(`  表达：${s.expression}`);
     if (s.natural) lines.push(`  更自然：${s.natural}`);
   }
 
   lines.push('');
   lines.push('─────────────');
-  lines.push(
-    `长停顿 ${pm.stalls.length} 次 · 填充词 ${pm.metrics.fillerPer100w}/百词`
-  );
+  const pauses = pm.metrics.longPausePerMin == null ? '—' : `${pm.stalls.length} 次`;
+  const filler =
+    pm.metrics.fillerPer100w == null ? '—' : `${pm.metrics.fillerPer100w}/百词`;
+  lines.push(`长停顿 ${pauses} · 填充词 ${filler}`);
   lines.push(`原始音频在 data/sessions/…/${pm.sessionId}/turns/`);
 
-  void writePostmortem(session, pm).catch((err) =>
-    console.error('[postmortem write]', err)
-  );
+  void writePostmortem(session, pm).catch((err) => console.error('[postmortem write]', err));
 
   return lines.join('\n');
 }
 
 export async function writePostmortem(session: Session, pm: Postmortem): Promise<void> {
-  await writeFile(
-    join(session.dir, 'postmortem.json'),
-    JSON.stringify(pm, null, 2),
-    'utf8'
-  );
+  await writeFile(join(session.dir, 'postmortem.json'), JSON.stringify(pm, null, 2), 'utf8');
 }

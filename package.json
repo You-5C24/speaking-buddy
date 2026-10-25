@@ -7,7 +7,12 @@
     "dev": "tsx watch --env-file=.env src/index.ts",
     "start": "tsx --env-file=.env src/index.ts",
     "probe:llm": "tsx --env-file=.env src/probe-llm.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:blocks": "tsx scripts/check-blocks.ts",
+    "check:scenarios": "tsx scripts/check-scenarios.ts",
+    "check": "tsx scripts/check-blocks.ts && tsx scripts/check-scenarios.ts && tsx scripts/check-runtime.ts",
+    "check:runtime": "tsx scripts/check-runtime.ts",
+    "probe:gen": "tsx --env-file=.env src/probe-scenario-gen.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",

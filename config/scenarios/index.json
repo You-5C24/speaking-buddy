@@ -1,0 +1,6 @@
+[
+  { "id": "cafe-1", "title": "点单 · 店员会听错一次", "level": "A2",
+    "aliases": ["1", "点单", "点餐", "买咖啡", "coffee", "cafe"] },
+  { "id": "free-1", "title": "自由聊 · 随便说，我接住", "level": "A2",
+    "aliases": ["2", "自由聊", "随便聊", "聊天", "chat", "free"] }
+]
