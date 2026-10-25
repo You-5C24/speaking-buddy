@@ -1,0 +1,7 @@
+node_modules/
+.venv/
+.env
+data/
+probe/audio/*.wav
+*.log
+.DS_Store
