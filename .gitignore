@@ -5,3 +5,7 @@ data/
 probe/audio/*.wav
 *.log
 .DS_Store
+
+# ffmpeg 二进制不进 git（43MB）。装系统 ffmpeg 即可，见 README。
+# 想锁死版本时才放到这里。
+vendor/

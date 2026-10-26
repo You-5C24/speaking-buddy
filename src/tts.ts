@@ -20,14 +20,22 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..');
 
 /**
- * 只有 ffmpeg 走 vendor/：`ffmpeg-static` 的 postinstall 要从 GitHub 下二进制，
- * 本机装不上。ffprobe 不在这里——`ffprobe-static` 是普通 npm 包，
- * 二进制直接发在 registry 上，能正常装，而且带 arm64 原生版本。
+ * ffmpeg 的查找顺序：`vendor/ffmpeg` → 环境变量 → 系统 PATH。
+ *
+ * `vendor/` 里那份**不进 git**（43MB 的二进制会让 clone 变得很痛），
+ * 所以必须能退回系统装的。`vendor/` 只用于想锁死版本的情况。
+ *
+ * 为什么不装 `ffmpeg-static`：它的 postinstall 要从 GitHub 下二进制，本机装不上。
+ * ffprobe 不在这里——`ffprobe-static` 是普通 npm 包，二进制直接发在 registry 上，
+ * 能正常装，而且自带 arm64 原生版本。
  */
 function ffmpegPath(): string {
   const vendored = join(REPO_ROOT, 'vendor', 'ffmpeg');
   if (existsSync(vendored)) return vendored;
-  throw new Error('找不到 ffmpeg：请把二进制放到 vendor/ffmpeg');
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
+  // 退到 PATH 上的 ffmpeg（brew install ffmpeg）。spawn 找不到时会报 ENOENT，
+  // 所以这里不做 existsSync —— PATH 上的可执行文件不该用路径判断。
+  return 'ffmpeg';
 }
 
 /** ffprobe-static 自带二进制（darwin/arm64 原生），不需要 vendor/ 里那份 */

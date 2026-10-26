@@ -60,9 +60,10 @@
 # 1. Node 依赖
 pnpm add @larksuiteoapi/node-sdk ffprobe-static zod dotenv
 
-# ffmpeg 用 vendor/ 里的二进制：ffmpeg-static 的 postinstall 要访问 GitHub，本机装不上。
-#   vendor/ffmpeg
-# ffprobe 不用放：ffprobe-static 是普通 npm 包，装得上，且自带 arm64 原生二进制。
+# ffmpeg：装系统版本就行（brew install ffmpeg）。
+#   不装 ffmpeg-static，它的 postinstall 要访问 GitHub，本机装不上。
+#   vendor/ffmpeg 是可选的：想锁死版本时放一份过去，代码会优先用它。
+# ffprobe：不用单独装，ffprobe-static 自带 arm64 原生二进制。
 
 # 2. Python ASR（注意锁 av 版本，否则装不上）
 python3 -m venv .venv
@@ -101,7 +102,7 @@ speaking-buddy/
 ├── config/scenarios/         # 场景 v2：index.json、cafe-1、free-1
 ├── data/sessions/            # 一次练习一个目录，原始音频保留
 ├── scripts/asr.py            # 唯一的 Python，常驻进程
-├── vendor/                   # ffmpeg / ffprobe 二进制
+├── vendor/                   # 可选：锁死版本的 ffmpeg（不进 git）
 ├── src/
 │   ├── index.ts              # WS 接入、去重、串行
 │   ├── lark.ts               # 飞书收发（v1.1 加群/话题支持）
