@@ -316,7 +316,9 @@ async function handleText(bot: ReturnType<typeof startBot>, msg: IncomingVoice) 
       if (!session) return;
       session.endedAt = new Date().toISOString();
       session.endReason = 'user_end';
-      const card = buildReview(session);
+      // 判分要逐句调模型，几秒钟。先说一句，别让人以为没反应。
+      await replyText(bot, msg, session, '好，我把这次的话过一遍，几秒。');
+      const card = await buildReview(session);
       await writeMeta(session);
       await replyText(bot, msg, session, card);
       return;

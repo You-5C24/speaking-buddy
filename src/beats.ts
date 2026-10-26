@@ -29,13 +29,17 @@ const SWAPS: { re: RegExp; from: string; to: string }[] = [
  * 不会回头改上一句里的 medium。这里从用户已经说过的话里挑一个词，写死换法。
  * 从最近一轮往前找，这一轮只是 “to go” 时仍能用到上一句的点单。
  */
-export function specifyMishear(directive: string, said: string[]): string {
-  if (!/\bmishear\b/i.test(directive)) return directive;
-  let hit: { from: string; to: string } | undefined;
+export function mishearTarget(directive: string, said: string[]): { from: string; to: string } | null {
+  if (!/\bmishear\b/i.test(directive)) return null;
   for (const text of [...said].reverse()) {
-    hit = SWAPS.find((swap) => swap.re.test(text));
-    if (hit) break;
+    const hit = SWAPS.find((swap) => swap.re.test(text));
+    if (hit) return { from: hit.from, to: hit.to };
   }
+  return null;
+}
+
+export function specifyMishear(directive: string, said: string[]): string {
+  const hit = mishearTarget(directive, said);
   if (!hit) return directive;
   return (
     `${directive}\n` +

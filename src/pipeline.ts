@@ -601,7 +601,6 @@ export async function runTurn(params: {
       ...(session.warmup ? {} : { opening: scenario.opening }),
       ...(scenario.goal ? { goal: scenario.goal } : {}),
       ...(scenario.hiddenGoal ? { hiddenGoal: scenario.hiddenGoal } : {}),
-      blocks: scenario.blocks.map((b) => ({ n: b.n, frame: b.frame })),
       ...(beatDirective ? { beatDirective } : {}),
       ...(session.seedText ? { seedText: session.seedText } : {}),
       history,
@@ -615,7 +614,7 @@ export async function runTurn(params: {
     trace.provider = model.id;
     if (completed.error) trace.llmError = completed.error;
     degraded = completed.degraded;
-    reply = sanitizeReply(completed.reply, asrResult.words, text);
+    reply = sanitizeReply(completed.reply);
   }
 
   const record: Turn = {

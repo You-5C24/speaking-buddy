@@ -14,6 +14,7 @@ import {
   sanitizeReply,
   type Reply,
 } from '../src/llm.js';
+import { verifySentence } from '../src/grading.js';
 import {
   createSession,
   longPauseGaps,
@@ -25,7 +26,7 @@ import {
   type Session,
   type Turn,
 } from '../src/pipeline.js';
-import { aggregateMetrics, buildReview } from '../src/review.js';
+import { aggregateMetrics, buildPostmortem, renderCard } from '../src/review.js';
 import { loadAll, resolveScenario } from '../src/scenarios.js';
 import { activeBeatDirective } from '../src/beats.js';
 import { plainTextFromPost } from '../src/lark.js';
@@ -81,42 +82,99 @@ const asWords = [
   { w: 'Americano' },
 ];
 const user = 'Could I get a medium as Americano';
-const droppedMean = sanitizeReply(
-  {
-    say: 'A medium Americano?',
-    rewrite: 'Could I get a medium Americano?',
-    flags: [flag('mean'), flag('as', 1)],
-  },
-  asWords,
-  user
-);
-eq('编出来的 mean 被丢掉', droppedMean.flags.map((f) => f.said), ['as']);
-ok('as 还在转写里，第一层不删它', droppedMean.flags.some((f) => f.said === 'as'));
-ok('还剩 flag 时改写留下', droppedMean.rewrite === 'Could I get a medium Americano?');
+// 判分搬去 grading.ts 之后，sanitizeReply 只留 say。
+const cleaned = sanitizeReply({
+  say: 'A medium Americano?',
+  rewrite: 'Could I get a medium Americano?',
+  flags: [flag('mean'), flag('as', 1)],
+});
+eq('只留 say', cleaned.say, 'A medium Americano?');
+eq('flags 不再从对话轮出来', cleaned.flags, []);
 
-const same = sanitizeReply(
-  { say: 'Got it.', rewrite: 'Could I get a medium as Americano', flags: [flag('as')] },
-  asWords,
-  user
-);
-ok('和原句一样的 rewrite 丢掉', same.rewrite == null);
+console.log('\nverifySentence()');
+const gWords = [
+  { w: 'I', p: 0.9 },
+  { w: 'paid', p: 0.7 },
+  { w: 'by', p: 0.9 },
+  { w: 'cash.', p: 0.4 },
+];
+const gTurn = { index: 1, text: 'I paid by cash.', words: gWords };
 
-const noFlag = sanitizeReply(
-  { say: 'Got it. That is $3.25', rewrite: 'Could I get a medium Americano?', flags: [flag('mean')] },
-  asWords,
-  user
+eq(
+  'unclear 不给改法',
+  (() => {
+    const v = verifySentence(
+      {
+        turn: 1,
+        form: 'full',
+        verdict: 'unclear',
+        said: 'cash',
+        fix: 'card',
+        better: 'I paid by card.',
+        why: '没听清',
+      },
+      gTurn
+    );
+    return [v.fix, v.better];
+  })(),
+  [null, null]
 );
-ok('flag 被滤光之后 rewrite 也丢掉', noFlag.flags.length === 0 && noFlag.rewrite == null);
-
-const neighbor = sanitizeReply(
-  {
-    say: 'The main pay?',
-    flags: [flag('main')],
-  },
-  payWords,
-  'What is the main pay at the register'
+eq(
+  'ok 不留下 said / better',
+  (() => {
+    const v = verifySentence(
+      { turn: 1, form: 'full', verdict: 'ok', said: 'x', fix: 'y', better: 'z' },
+      gTurn
+    );
+    return [v.said, v.fix, v.better];
+  })(),
+  [null, null, null]
 );
-eq('main 是转写里的词，第一层留着', neighbor.flags.map((f) => f.said), ['main']);
+eq(
+  '编出来的片段被丢掉',
+  verifySentence({ turn: 1, form: 'full', verdict: 'wrong', said: 'enlarge', fix: 'large' }, gTurn).said,
+  null
+);
+eq(
+  '转写里真有的片段留着',
+  verifySentence({ turn: 1, form: 'full', verdict: 'wrong', said: 'paid by cash', fix: 'paid in cash' }, gTurn).said,
+  'paid by cash'
+);
+eq(
+  '热身轮不判 wrong',
+  verifySentence({ turn: 0, form: 'full', verdict: 'wrong', said: 'paid', fix: 'pay' }, { ...gTurn, index: 0 })
+    .verdict,
+  'ok'
+);
+eq(
+  '要改的词是猜测 → 降成 unclear 且不给改法',
+  (() => {
+    // cash 的 p=0.4 是猜的；改法把 cash 换成了 card，所以这是「没听清」
+    const v = verifySentence(
+      { turn: 1, form: 'full', verdict: 'wrong', said: 'by cash', fix: 'by card' },
+      gTurn
+    );
+    return [v.verdict, v.fix];
+  })(),
+  ['unclear', null]
+);
+eq(
+  '要改的词听得清 → 照常判',
+  (() => {
+    // 改的是 by（p=0.9），cash 是猜的不影响
+    const v = verifySentence(
+      { turn: 1, form: 'full', verdict: 'wrong', said: 'paid by', fix: 'paid in' },
+      gTurn
+    );
+    return v.verdict;
+  })(),
+  'wrong'
+);
+eq(
+  '模型说 unclear 时当作没判，不降成问题',
+  verifySentence({ turn: 1, form: 'full', verdict: 'unclear', said: 'cash' }, gTurn).verdict,
+  'ok'
+);
 
 console.log('\nisHelpSeeking()');
 ok('中文是求助', isHelpSeeking('拿铁怎么说', []));
@@ -142,7 +200,8 @@ const beat = buildMessages({
   userText: 'A latte.',
 }).find((m) => m.role === 'system')!.content;
 ok('goal 进 prompt', beat.includes('Scenario goal: 点一杯咖啡'));
-ok('块进 prompt', beat.includes('1. Could I get a ___ ?'));
+// 三句卡是用户的脚手架，不是模型的剧本。进了 prompt 它会往那三句上引，对话就固定了。
+ok('块不进对话 prompt', !beat.includes('Could I get a ___'));
 ok('beat 是硬注入', beat.includes('THIS TURN ONLY: This turn, mishear one detail of their order.'));
 ok('不写成软要求', !beat.includes('if you like') && !beat.includes('you might'));
 
@@ -392,60 +451,75 @@ ok(
 );
 
 const dir = await mkdtemp(join(tmpdir(), 'sb-review-'));
+/** 判分要联网，本地自检只喂现成的判定结果 —— buildPostmortem/renderCard 都是纯函数 */
+const graded = (turns: { turn: number; verdict: 'ok' | 'unnatural' | 'wrong' | 'unclear'; said?: string; fix?: string; better?: string; why?: string; note?: string; form?: 'full' | 'fragment' }[]) => ({
+  sentences: turns.map((t) => ({ form: 'full' as const, ...t })),
+  drills: [],
+});
+
 try {
   const session = await createSession('oc_test', cafe, { dir, listTitle: '点单 · 店员会听错一次' });
   const meta = (await readMeta(dir)) as { scenarioId: string | null };
   eq('meta.scenarioId 是 cafe-1', meta.scenarioId, 'cafe-1');
 
   session.warmup = fakeTurn(0, 'Could I get a medium latte', { say: 'Nice, a medium latte.' });
-  session.turns = [
-    fakeTurn(1, 'No.', {
-      say: "Got it. That's $3.25",
-      flags: [{ said: 'No', better: 'No thanks', type: 'fluency', severity: 1, why: '太短' }],
-    }),
-  ];
-  const card = buildReview(session);
+  session.turns = [fakeTurn(1, 'No.', { say: "Got it. That's $3.25" })];
+  const card = renderCard(session, buildPostmortem(session, graded([
+    { turn: 0, verdict: 'ok' },
+    { turn: 1, verdict: 'ok' },
+  ])));
   ok('1 号块算上热身', card.includes('1 ✓'));
   ok('还没问到的块是 —', card.includes('2 —') && card.includes('3 —'));
   ok('不把没轮到写成 ✗', !card.includes('2 ✗') && !card.includes('3 ✗'));
-  ok('更自然不拿 bot 的台词充数', !card.includes("Got it. That's $3.25") && !card.includes('更自然'));
-  ok('只有 1 级 flag 时不单列', !card.includes('最该改的一点'));
+  ok('卡片不印语速', !card.includes('wpm') && !card.includes('语速'));
+  ok('卡片不出现 bot 的台词', !card.includes("Got it. That's $3.25"));
   ok('卡片不出现隐藏目标字段名', !card.includes('hiddenGoal'));
 
-  const withRewrite = await createSession('oc_test', cafe, {
+  // 四档 + 逐句都要出现
+  const withMarks = await createSession('oc_test', cafe, {
     dir: join(dir, 'rw'),
     listTitle: '点单 · 店员会听错一次',
   });
-  withRewrite.warmupDone = true;
-  withRewrite.turns = [
-    fakeTurn(1, 'I want a medium Americano', {
-      say: 'One medium Americano, for here?',
-      rewrite: 'Could I get a medium Americano?',
-      flags: [{ said: 'I want', better: 'Could I get', type: 'collocation', severity: 2, why: '点单用 Could I get 更礼貌' }],
-    }),
-    fakeTurn(2, 'Yes', { say: 'For here?' }),
-    fakeTurn(3, 'For here please', { say: 'Got it.' }),
-    fakeTurn(4, 'Thanks', { say: 'Sure.' }),
+  withMarks.warmupDone = true;
+  withMarks.turns = [
+    fakeTurn(1, 'I want to enlarge the iced Americano', { say: 'One large?' }),
+    fakeTurn(2, 'A regular ice tea is better for me', { say: 'Ok.' }),
+    fakeTurn(3, 'Do you have some coupons?', { say: 'No.' }),
+    fakeTurn(4, 'For here', { say: 'Got it.' }),
   ];
-  const card2 = buildReview(withRewrite);
-  ok('更自然是用户那句的改写', card2.includes('更自然：Could I get a medium Americano?'));
-  ok('severity>=2 才单列', card2.includes('最该改的一点') && card2.includes('Could I get'));
-  ok('问过了还没用 3 号块是 ✗', card2.includes('3 ✗'));
+  const card2 = renderCard(
+    withMarks,
+    buildPostmortem(withMarks, {
+      sentences: [
+        { turn: 1, form: 'full', verdict: 'unnatural', said: 'enlarge the', fix: 'a large', better: 'Could I get a large iced Americano?', why: '点单不说 enlarge' },
+        { turn: 2, form: 'full', verdict: 'unclear', said: 'ice', why: '这个词没听清' },
+        { turn: 3, form: 'full', verdict: 'wrong', said: 'some', fix: 'any', better: 'Do you have any coupons?', why: '疑问句用 any' },
+        { turn: 4, form: 'full', verdict: 'ok' },
+      ],
+      drills: ['Do you have any ___ ? — 疑问句用 any'],
+    })
+  );
+  ok('不地道给整句改写', card2.includes('~') && card2.includes('Could I get a large iced Americano?'));
+  ok('没听清明确说不判', card2.includes('?') && card2.includes('这次不判'));
+  ok('要改指出具体片段', card2.includes('some → any'));
+  ok('没问题也逐句列出', card2.includes('For here'));
+  ok('四档都计数', card2.includes('✓ 1 句没问题') && card2.includes('✗ 1 句要改'));
+  ok('练习项来自本场', card2.includes('下次先练这组') && card2.includes('any'));
+
+  // 判分整场挂掉也要出卡片
+  const broken = renderCard(session, buildPostmortem(session, { sentences: [], drills: [] }));
+  ok('判分失败仍出卡片', broken.includes('没判出来'));
 
   const freeSession: Session = await createSession('oc_test', free, {
     dir: join(dir, 'free'),
     listTitle: '自由聊 · 随便说，我接住',
   });
-  freeSession.turns = [
-    fakeTurn(1, 'I went hiking', {
-      say: 'How long did you walk?',
-      rewrite: 'I went hiking today.',
-      flags: [flag('hiking')],
-    }),
-  ];
-  const freeCard = buildReview(freeSession);
-  ok('rewrite 卡片不显示块使用', !freeCard.includes('三句用了') && !freeCard.includes('1 ✗'));
-  ok('rewrite 卡片计数', freeCard.includes('说得更自然 1 处'));
+  freeSession.turns = [fakeTurn(1, 'I went hiking', { say: 'How long did you walk?' })];
+  const freeCard = renderCard(
+    freeSession,
+    buildPostmortem(freeSession, graded([{ turn: 1, verdict: 'ok' }]))
+  );
+  ok('rewrite 卡片不显示块使用', !freeCard.includes('三句用了'));
   ok('隐藏目标不上卡片', free.hiddenGoal ? !freeCard.includes(free.hiddenGoal) : true);
 
   const freeMeta = (await readMeta(join(dir, 'free'))) as { scenarioId: string | null };

@@ -27,11 +27,20 @@ export const Flag = z.object({
   why: z.string().optional(),
 });
 
+/**
+ * 对话轮只负责「说」。判分在 `grading.ts`，`/end` 时跑，不带角色。
+ *
+ * 曾经对话轮同时产出 `flags` / `rewrite`，代价是：
+ * - 模型带着角色去判，把你「点了茶不点咖啡」算成语言错误
+ * - `rewrite` 被 `if (flags.length === 0) rewrite = undefined` 连坐，
+ *   语法对但不地道的句子永远记不下来
+ * - prompt 里那一大段 JSON 契约挤占了它本该用来接话的注意力
+ * 那三个字段留在 schema 里只为读回旧场次（`pipeline.ts` 的 `readTurnFile`）。
+ */
 export const Reply = z.object({
   say: z.string().min(1).max(300),
-  /** 用户这句话，母语者会怎么说。和原句一样、或这一轮没有 flag，就省略 */
   rewrite: z.string().max(200).nullable().optional(),
-  flags: z.array(Flag).max(5),
+  flags: z.array(Flag).max(5).optional(),
 });
 
 export type Flag = z.infer<typeof Flag>;
@@ -66,22 +75,15 @@ Rules:
   yes/no questions with a reason, A-or-B choices, "what kind of ___".
   Never ask an open question that can be answered with one word.
 - Never ask "Anything else?" as your only question. It invites a one-word answer.
-- Words marked like [word? p=0.38] are ASR guesses. Do not build a flag whose
-  "said" is one of them, and do not "fix" a neighbouring word just because it
-  looks wrong next to a guess — the guess is probably what's wrong.
-- "rewrite": if the learner's sentence could be said more naturally, write THEIR
-  sentence the way a native speaker would. Same meaning, same length roughly.
-  Not your own reply. Omit if nothing to improve.
-- "why": one Chinese sentence naming the better form you just used
-  ("点单用 Could I get 比 I want 礼貌，这才是店员期待的句式"). Not a grammar lecture.
+- Words marked like [word? p=0.38] are ASR guesses. Treat them as probably-what-they-
+  said; never correct a neighbouring word just because it looks wrong next to a guess.
+- If they ask how to say something, answer it in one short sentence and then keep going.
+- You are NOT grading. There is no score, no correction list, no rewrite. Someone else
+  reads the transcript afterwards. Your only job is to be a believable conversation
+  partner and keep it moving.
 
 Return ONLY a JSON object, nothing else:
-{"say": "<your spoken reply>", "rewrite": "<their sentence, more naturally — omit the key if nothing to improve>", "flags": [{"said": "...", "better": "...", "type": "grammar|collocation|vocab|fluency", "severity": 1, "why": "<一句中文>"}]}
-
-flags = errors you noticed this turn. Use [] if none.
-- "type": "very" modifying a verb is a COLLOCATION problem, not grammar.
-- "severity": 1 = doesn't affect meaning, 2 = slightly, 3 = affects understanding.
-- Be conservative. Only flag what a teacher would actually mention.
+{"say": "<your spoken reply>"}
 `.trim();
 
 export function buildMessages(params: {
@@ -89,7 +91,6 @@ export function buildMessages(params: {
   opening?: string;
   goal?: string;
   hiddenGoal?: string;
-  blocks?: { n: number; frame: string }[];
   /** 这一轮的 beat。有就原样追加，不写成「可以的话」这种软要求 */
   beatDirective?: string;
   seedText?: string;
@@ -98,12 +99,10 @@ export function buildMessages(params: {
 }): Msg[] {
   let system = `You are an English speaking partner.\n\nYour role: ${params.persona}\n\n${RULES}`;
 
+  // 三句卡**不再进对话 prompt**。原来写成 `Blocks the learner prepared`，
+  // 等于告诉店员「这个人手里有三张牌」，它会不自觉地往那三句上引，
+  // 对话就固定死了。那三句是用户的脚手架，不是模型的剧本。
   if (params.goal) system += `\n\nScenario goal: ${params.goal}`;
-  if (params.blocks?.length) {
-    system +=
-      `\n\nBlocks the learner prepared (they may use these):\n` +
-      params.blocks.map((b) => `${b.n}. ${b.frame}`).join('\n');
-  }
   if (params.hiddenGoal) {
     system += `\n\nYour own agenda this session (never state it, just steer): ${params.hiddenGoal}`;
   }
@@ -148,33 +147,22 @@ export type CleanReply = {
 };
 
 /**
- * 第一层护栏 + rewrite 的两条代码校验。
- * 不做 STOPWORDS 过滤：虚词恰恰是最常被幻觉出来的（§5 第三层）。
+ * 只保留 `say`。
+ *
+ * 以前这里还有一层「`said` 必须是转写里真有的片段」的护栏，连同 `rewrite`
+ * 的两条校验。判分搬去 `grading.ts` 之后，那套护栏跟着搬到了
+ * `grading.ts` 的 `verifySentence()`——它必须在**评分**这一侧生效，
+ * 而不是在对话这一侧。
  */
-export function sanitizeReply(
-  reply: Reply,
-  words: { w: string }[],
-  userText: string
-): CleanReply {
-  const source = words.length ? words.map((w) => w.w).join(' ') : userText;
-  const transcript = ` ${norm(source)} `;
-  const flags = reply.flags.filter((f) => {
-    const said = norm(f.said);
-    return said.length > 0 && transcript.includes(` ${said} `);
-  });
-
-  let rewrite = reply.rewrite?.trim() || undefined;
-  if (rewrite && norm(rewrite) === norm(userText)) rewrite = undefined;
-  if (flags.length === 0) rewrite = undefined;
-
-  return rewrite ? { say: reply.say, flags, rewrite } : { say: reply.say, flags };
+export function sanitizeReply(reply: Reply): CleanReply {
+  return { say: reply.say, flags: [], ...(reply.rewrite ? { rewrite: reply.rewrite } : {}) };
 }
 
 const HELP_LINE = 'Try asking: "How do you say ___ in English?"';
 
 /**
- * 转写基本是中文，或一整句每个词都低于标注线：这轮是求助，不建 flag。
- * 短答不算。这场 “Black” 只有一个词、p=0.54，是在回答 Black or with milk，
+ * 转写基本是中文，或一整句每个词都低于标注线：这轮是求助。
+ * 短答不算。`Black` 只有一个词、p=0.54，是在回答 Black or with milk，
  * 不该回 How do you say。那种情况交给模型，并在转写里标出置信度。
  */
 export function isHelpSeeking(text: string, words: { p: number }[]): boolean {
@@ -198,7 +186,7 @@ export function helpSeekingReply(): CleanReply {
  * 中转站实测会返回 ```json 包裹的内容（6 次里有 2 次）。
  * Moonshot 不会。这里统一剥一遍，成本为零。
  */
-function stripFence(s: string): string {
+export function stripFence(s: string): string {
   const t = s.trim();
   if (!t.startsWith('```')) return t;
   return t
@@ -208,7 +196,7 @@ function stripFence(s: string): string {
 }
 
 /** 有些模型会把多个 JSON 对象拼在一起，取第一个完整对象 */
-function firstJsonObject(s: string): string {
+export function firstJsonObject(s: string): string {
   const start = s.indexOf('{');
   if (start < 0) return s;
   let depth = 0;
@@ -241,7 +229,7 @@ type OpenAIResponse = {
   };
 };
 
-async function callChat(params: {
+export async function callChat(params: {
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -351,18 +339,30 @@ export function makeChatModel(cfg: ProviderConfig): ChatModel {
 // ────────────────────────────────────────────────────────────
 
 export function moonshot(env = process.env): ChatModel {
+  const cfg = moonshotConfig(env);
+  return makeChatModel({ id: 'moonshot', label: cfg.model, ...cfg });
+}
+
+/**
+ * Moonshot 的连接参数。`moonshot()` 和复盘评分（`grading.ts`）共用一份，
+ * 免得评分那边自己抄一遍 baseUrl、抄错 `thinking`。
+ */
+export function moonshotConfig(env = process.env): {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  extra?: Record<string, unknown>;
+} {
   const key = requireEnv(env, 'MOONSHOT_API_KEY');
   // highspeed 关不掉思考。prompt 变长后推理 token 到过 1836，单轮模型 9.5 秒。
   // k2.6 可以 thinking.type=disabled。实测正式轮 0.5–1.4 秒，推理 token 为 1。
   const model = env.MOONSHOT_MODEL ?? 'kimi-k2.6';
-  return makeChatModel({
-    id: 'moonshot',
-    label: model,
+  return {
     baseUrl: 'https://api.moonshot.cn/v1',
     apiKey: key,
     model,
     ...(model === 'kimi-k2.6' ? { extra: { thinking: { type: 'disabled' } } } : {}),
-  });
+  };
 }
 
 /**

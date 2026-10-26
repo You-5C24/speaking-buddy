@@ -47,13 +47,8 @@ async function runModel(label: string, model: ReturnType<typeof moonshot>) {
     console.log(`\n[${c.name}]  ${ms}ms${degraded ? '  ⚠️ DEGRADED' : ''}`);
     if (error) console.log(`  error: ${error}`);
     console.log(`  say: ${reply.say}`);
-    for (const f of reply.flags) {
-      console.log(
-        `  flag: "${f.said}" → "${f.better}"  [${f.type} sev${f.severity}]` +
-          (f.why ? `  ${f.why}` : '')
-      );
-    }
-    if (reply.flags.length === 0) console.log('  (no flags)');
+    // 对话轮不再产出 flags，这个探针只剩 say。要调评分质量用 pnpm grade。
+    console.log('  (对话轮只出 say)');
   }
 }
 
