@@ -26,6 +26,8 @@ export type IncomingVoice = {
   messageId: string;
   chatId: string;
   chatType: string;
+  /** 群模式 `topic` / `group` / `p2p`。事件里没有，查一次 chat.get 后缓存 */
+  chatMode?: string;
   msgType: 'audio' | 'text' | 'other';
   fileKey?: string;
   durationMs?: number;
@@ -92,6 +94,30 @@ class SeenEvents {
     return this.set.has(id);
   }
 
+  /**
+   * 去重 + 占坑，**一次做完**。返回 false 表示这条已经处理过了。
+   *
+   * 必须是原子的：`has()` 再 `add()` 中间只要隔一个 await，飞书重推的两条
+   * 就会同时通过判断。这里 `load()` 之后检查与写入之间没有 await，
+   * 第二条进来时看到的一定是第一条已经写进去的状态。
+   *
+   * 占坑放在「干活之前」，所以即使后面 `chat.get` 慢或失败，
+   * 重复推送也不会重复回复。
+   */
+  async claim(id: string): Promise<boolean> {
+    await this.load();
+    if (this.set.has(id)) return false;
+    this.set.add(id);
+    // 滚动保留最近 N 条
+    if (this.set.size > SEEN_LIMIT) {
+      const keep = Array.from(this.set).slice(-SEEN_LIMIT);
+      this.set = new Set(keep);
+    }
+    await mkdir(DATA_DIR, { recursive: true });
+    await writeFile(SEEN_PATH, JSON.stringify(Array.from(this.set)), 'utf8');
+    return true;
+  }
+
   async add(id: string): Promise<void> {
     await this.load();
     this.set.add(id);
@@ -106,6 +132,41 @@ class SeenEvents {
 }
 
 export const seen = new SeenEvents();
+
+// ────────────────────────────────────────────────────────────
+// 群模式缓存
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 消息事件里没有 `chat_mode`，只能查 `chat.get`。查一次缓存住。
+ *
+ * 为什么必须有它：`topic.ts` 的 `primaryKey` 要区分「话题群」和「普通群」。
+ * 话题群按 `thread_id` 隔离，普通群必须退回 `chatId`——普通群里的 `root_id`
+ * 是回复链的根，按它分会每说一句就新开一场练习。
+ *
+ * 查失败返回 undefined，`primaryKey` 会当成「模式未知」按话题隔离，
+ * 宁可多分一间，也不把两个话题并成一场。
+ */
+const chatModes = new Map<string, string | undefined>();
+
+async function chatModeOf(client: Lark.Client, chatId: string, chatType: string): Promise<string | undefined> {
+  const cached = chatModes.get(chatId);
+  if (cached !== undefined) return cached;
+  // 单聊不必查，事件里的 chat_type 已经说清楚了
+  if (chatType === 'p2p') {
+    chatModes.set(chatId, 'p2p');
+    return 'p2p';
+  }
+  try {
+    const res = await client.im.v1.chat.get({ path: { chat_id: chatId } });
+    const mode = res.data?.chat_mode;
+    if (mode) chatModes.set(chatId, mode);
+    return mode;
+  } catch (err) {
+    console.warn(`[lark] 查不到 ${chatId} 的 chat_mode`, err instanceof Error ? err.message : err);
+    return undefined;
+  }
+}
 
 // ────────────────────────────────────────────────────────────
 // 按 sessionKey 串行
@@ -253,8 +314,17 @@ export function startBot(opts: BotOptions): Bot {
         });
       }
 
+      // ① 去重 + 占坑，一步做完（见 SeenEvents.claim 的注释）。
+      //    必须在任何 await 出来的窗口之前，否则重推的两条会同时通过。
+      if (eventId && !(await seen.claim(eventId))) return;
+
+      // ② 立即 ack：加 reaction，然后把活扔进队列
+      void bot.react(m.message_id, 'OnIt');
+
+      // ③ 群模式：命中缓存就直接返回，只有第一次查 chat.get
       const threadId = presentId(m.thread_id);
       const rootId = presentId(m.root_id);
+      const chatMode = await chatModeOf(client, m.chat_id, m.chat_type);
       const msg: IncomingVoice = {
         eventId,
         messageId: m.message_id,
@@ -263,23 +333,16 @@ export function startBot(opts: BotOptions): Bot {
         msgType: kind,
         senderOpenId: data.sender.sender_id?.open_id ?? '',
         text: parsed.text,
+        ...(chatMode ? { chatMode } : {}),
         ...(parsed.fileKey ? { fileKey: parsed.fileKey } : {}),
         ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
         ...(threadId ? { threadId } : {}),
         ...(rootId ? { rootId } : {}),
       };
 
-      // ① 去重（必须在任何 await 之前完成判断）
-      if (eventId && (await seen.has(eventId))) return;
-
-      // ② 立即 ack：加 reaction，然后把活扔进队列
-      void bot.react(m.message_id, 'OnIt');
-
-      // ③ 按话题串行。两个话题的键不同，可以同时跑
-      enqueue(primaryKey(msg), async () => {
-        if (eventId) await seen.add(eventId);
-        await onMessage(msg);
-      });
+      // ④ 按话题串行。两个话题的键不同，可以同时跑。
+      //    event_id 在 ① 已经登记过，这里不要再记一次。
+      enqueue(primaryKey(msg), () => onMessage(msg));
     },
   });
 

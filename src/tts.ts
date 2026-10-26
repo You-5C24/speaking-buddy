@@ -19,16 +19,19 @@ import ffprobeStatic from 'ffprobe-static';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..');
 
-/** 优先用 vendor/ffmpeg；ffmpeg-static 的 postinstall 要访问 GitHub，本机装不上 */
+/**
+ * 只有 ffmpeg 走 vendor/：`ffmpeg-static` 的 postinstall 要从 GitHub 下二进制，
+ * 本机装不上。ffprobe 不在这里——`ffprobe-static` 是普通 npm 包，
+ * 二进制直接发在 registry 上，能正常装，而且带 arm64 原生版本。
+ */
 function ffmpegPath(): string {
   const vendored = join(REPO_ROOT, 'vendor', 'ffmpeg');
   if (existsSync(vendored)) return vendored;
   throw new Error('找不到 ffmpeg：请把二进制放到 vendor/ffmpeg');
 }
 
+/** ffprobe-static 自带二进制（darwin/arm64 原生），不需要 vendor/ 里那份 */
 function ffprobePath(): string {
-  const vendored = join(REPO_ROOT, 'vendor', 'ffprobe');
-  if (existsSync(vendored)) return vendored;
   return ffprobeStatic.path;
 }
 

@@ -330,7 +330,33 @@ export async function attachScenario(
   await writeMeta(session);
 }
 
-/** 只算三个纯声学指标，不依赖 LLM */
+/**
+ * 相邻词的间隙超过阈值的那些（毫秒）。**只留这一个实现**：
+ * `metrics()` 和复盘卡片的 `stalls` 共用，避免两处公式各改一半（06 §7③）。
+ *
+ * whisper 会把静音吞进相邻词的时长里，所以这里结构上基本恒为空。
+ * 空不代表「没有停顿」，代表「测不出来」——调用方必须写成 null，不能写成 0。
+ */
+export function longPauseGaps(
+  words: Turn['words'],
+  thresholdMs = 1500
+): { at: number; gapMs: number }[] {
+  const out: { at: number; gapMs: number }[] = [];
+  for (let i = 1; i < words.length; i++) {
+    const gapMs = (words[i]!.start - words[i - 1]!.end) * 1000;
+    if (gapMs > thresholdMs) out.push({ at: i, gapMs });
+  }
+  return out;
+}
+
+/**
+ * 只算三个纯声学指标，不依赖 LLM。
+ *
+ * `longPausePerMin` / `fillerPer100w` 在**测不出来**时是 null 不是 0：
+ * - 间隙永远为 0（whisper 吞静音）
+ * - whisper 倾向丢掉 um / uh，检测到 0 个不等于真的没说
+ * 卡片上 null 显示 `—`，0 显示 `0`，两种意思不能混（06 §6 第 4 条）。
+ */
 export function metrics(words: Turn['words']) {
   if (words.length < 2) return null;
   const first = words[0]!;
@@ -339,18 +365,13 @@ export function metrics(words: Turn['words']) {
   if (speechMs <= 0) return null;
   const minutes = speechMs / 60000;
 
-  let longPauses = 0;
-  for (let i = 1; i < words.length; i++) {
-    const gap = (words[i]!.start - words[i - 1]!.end) * 1000;
-    if (gap > 1500) longPauses++;
-  }
-
+  const longPauses = longPauseGaps(words).length;
   const fillers = words.filter((w) => /^(um|uh|erm|hmm|er|ah)$/i.test(w.w)).length;
 
   return {
     wpm: Math.round(words.length / minutes),
-    longPausePerMin: Number((longPauses / minutes).toFixed(1)),
-    fillerPer100w: Number(((fillers / words.length) * 100).toFixed(1)),
+    longPausePerMin: longPauses === 0 ? null : Number((longPauses / minutes).toFixed(1)),
+    fillerPer100w: fillers === 0 ? null : Number(((fillers / words.length) * 100).toFixed(1)),
     speechMs: Math.round(speechMs),
     words: words.length,
     longPauses,

@@ -7,7 +7,7 @@
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assignNotReached, computeBlockUsage, type BlockUsage } from './blocks.js';
-import { metrics, type Session, type Turn } from './pipeline.js';
+import { longPauseGaps, metrics, type Session, type Turn } from './pipeline.js';
 
 const MAX_SENTENCES = 3;
 
@@ -63,7 +63,8 @@ export function aggregateMetrics(session: Session): AggregateMetrics {
   return {
     wpm: Math.round(words / minutes),
     longPausePerMin: longPauses === 0 ? null : Number((longPauses / minutes).toFixed(1)),
-    fillerPer100w: Number(((fillers / words) * 100).toFixed(1)),
+    // 一个填充词都没检测到 ≠ 用户没说。whisper 倾向丢掉 um / uh，写 null 显示 —（§7）
+    fillerPer100w: fillers === 0 ? null : Number(((fillers / words) * 100).toFixed(1)),
   };
 }
 
@@ -121,15 +122,13 @@ export function buildPostmortem(session: Session, endReason = 'user_end'): Postm
   );
   const top = allFlags.filter((f) => f.severity >= 2).sort((a, b) => b.severity - a.severity)[0];
 
-  const stalls = session.turns.flatMap((t) => {
-    const w = t.words;
-    const out: { turn: number; signal: string; pauseMs: number }[] = [];
-    for (let i = 1; i < w.length; i++) {
-      const gap = (w[i]!.start - w[i - 1]!.end) * 1000;
-      if (gap > 1500) out.push({ turn: t.index, signal: 'long_pause', pauseMs: Math.round(gap) });
-    }
-    return out;
-  });
+  const stalls = session.turns.flatMap((t) =>
+    longPauseGaps(t.words).map(({ gapMs }) => ({
+      turn: t.index,
+      signal: 'long_pause',
+      pauseMs: Math.round(gapMs),
+    }))
+  );
 
   const blockUsage = blockUsageFor(session);
   session.blockUsage = blockUsage;

@@ -16,6 +16,8 @@ import {
 } from '../src/llm.js';
 import {
   createSession,
+  longPauseGaps,
+  metrics,
   nextTurnIndex,
   readMeta,
   restoreOpenSessions,
@@ -23,7 +25,7 @@ import {
   type Session,
   type Turn,
 } from '../src/pipeline.js';
-import { buildReview } from '../src/review.js';
+import { aggregateMetrics, buildReview } from '../src/review.js';
 import { loadAll, resolveScenario } from '../src/scenarios.js';
 import { activeBeatDirective } from '../src/beats.js';
 import { plainTextFromPost } from '../src/lark.js';
@@ -190,6 +192,30 @@ eq(
 const other = { chatId: chat, messageId: 'om_other', chatType: 'group', threadId: 'omt_2' };
 ok('两个话题不是同一个键', primaryKey(follow) !== primaryKey(other));
 eq('有 root 时锚点是根消息', anchorId(follow), 'om_root');
+
+// 普通群：root_id 是回复链的根，不是话题 id。退回 chatId，否则每说一句新开一场
+const plain1 = { chatId: chat, messageId: 'om_a', chatType: 'group', chatMode: 'group' };
+const plain2 = { chatId: chat, messageId: 'om_b', chatType: 'group', chatMode: 'group' };
+const plainReply = {
+  chatId: chat,
+  messageId: 'om_c',
+  chatType: 'group',
+  chatMode: 'group',
+  rootId: 'om_a',
+};
+eq('普通群退回 chatId', primaryKey(plain1), `${chat}:${chat}`);
+eq('普通群里两条独立语音是同一场', primaryKey(plain1), primaryKey(plain2));
+eq('普通群里回复别人的消息也还是同一场', primaryKey(plainReply), `${chat}:${chat}`);
+eq('普通群只有一个查找键', lookupKeys(plainReply), [`${chat}:${chat}`]);
+ok(
+  '话题群仍然按话题隔离',
+  primaryKey({ ...follow, chatMode: 'topic' }) !==
+    primaryKey({ ...other, chatMode: 'topic' })
+);
+ok(
+  '群模式查不到时按话题隔离（宁可多分一间）',
+  primaryKey({ ...plain1, chatMode: undefined }) !== `${chat}:${chat}`
+);
 eq(
   '话题富文本里的 1 能读出来',
   plainTextFromPost({
@@ -204,6 +230,38 @@ eq(
   }),
   '点单'
 );
+
+console.log('\nmetrics() — 测不出来写 null，不写 0');
+const twoWords = [
+  { w: 'Could', start: 0, end: 0.4, p: 0.9 },
+  { w: 'I', start: 0.4, end: 0.6, p: 0.9 },
+];
+const flat = metrics(twoWords)!;
+eq('没有长停顿，但记录为 null 不是 0', flat.longPausePerMin, null);
+eq('没有填充词，也记 null 不是 0', flat.fillerPer100w, null);
+eq('语速照常算', flat.wpm, 200);
+eq('单轮数词仍然保留', flat.words, 2);
+eq('间隙为空', longPauseGaps(twoWords), []);
+
+const gappy = [
+  { w: 'Well', start: 0, end: 0.4, p: 0.9 },
+  { w: 'um', start: 2.5, end: 2.7, p: 0.9 },
+  { w: 'sure', start: 2.7, end: 3.1, p: 0.9 },
+];
+eq('有真实间隙时能测出来', longPauseGaps(gappy).length, 1);
+eq('间隙是 2.1 秒', Math.round(longPauseGaps(gappy)[0]!.gapMs), 2100);
+ok('有间隙时长停顿不是 null', metrics(gappy)!.longPausePerMin !== null);
+ok('有填充词时填充率不是 null', metrics(gappy)!.fillerPer100w !== null);
+
+console.log('\naggregateMetrics()');
+const aggSession = { turns: [{ index: 1, userText: 'x', words: twoWords, reply: { say: 'y', flags: [] } }] } as unknown as Session;
+const agg = aggregateMetrics(aggSession);
+eq('全轮都没测出停顿 → null', agg.longPausePerMin, null);
+eq('全轮都没测出填充 → null', agg.fillerPer100w, null);
+eq('语速仍然有值', agg.wpm, 200);
+
+const emptyAgg = aggregateMetrics({ turns: [] } as unknown as Session);
+eq('没有轮次时三个都 null', emptyAgg, { wpm: null, longPausePerMin: null, fillerPer100w: null });
 
 console.log('\nbuildWarmupLine()');
 const opening = 'Hi! What can I get for you today?';

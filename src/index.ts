@@ -58,21 +58,14 @@ async function catalog(): Promise<Catalog> {
   return cached;
 }
 
-/** 同一个 Session 会挂在多个键上：messageId、rootId、threadId。结束后留着，避免自动重开 */
+/**
+ * 同一个 Session 会挂在多个键上：messageId、rootId、threadId。结束后留着，避免自动重开。
+ *
+ * 串行只在 `lark.ts` 的 `enqueue` 里做，键是 `primaryKey(msg)`（= sessionKey）。
+ * 这里不要再按 chatId 加一层锁：那会让同一群里两个话题互相等，
+ * 而 §9 第 11 条要的正是「A 的 5 秒链路不卡住 B」。
+ */
 const sessions = new Map<string, Session>();
-
-const chatGates = new Map<string, Promise<void>>();
-
-function withChatLock<T>(chatId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = chatGates.get(chatId) ?? Promise.resolve();
-  const run = prev.catch(() => {}).then(fn);
-  const settled = run.then(
-    () => {},
-    () => {}
-  );
-  chatGates.set(chatId, settled);
-  return run;
-}
 
 function findSession(msg: IncomingVoice): Session | null {
   for (const key of lookupKeys(msg)) {
@@ -237,98 +230,92 @@ function flowOf(session: Session | null) {
 }
 
 async function handleText(bot: ReturnType<typeof startBot>, msg: IncomingVoice) {
-  await withChatLock(msg.chatId, async () => {
-    const session = findSession(msg);
-    if (session) remember(session, msg);
-    const picked = await lookup(msg.text);
-    const action = nextAction(flowOf(session), {
-      kind: 'text',
-      alias: picked != null,
-      endCommand: isEndCommand(msg.text),
-      seed: isSeedText(msg.text),
-    });
+  const session = findSession(msg);
+  if (session) remember(session, msg);
+  const picked = await lookup(msg.text);
+  const action = nextAction(flowOf(session), {
+    kind: 'text',
+    alias: picked != null,
+    endCommand: isEndCommand(msg.text),
+    seed: isSeedText(msg.text),
+  });
 
-    switch (action) {
-      case 'note-ended':
-        await replyText(bot, msg, session, ENDED_TEXT);
-        return;
-      case 'restart':
-        if (session) forget(session);
-        await openScenario(bot, msg, picked!.scenario, picked!.title, msg.text);
-        return;
-      case 'start-seed': {
-        const cat = await catalog();
-        const scenario = cat.byId.get('free-1');
-        const title = cat.index.find((e) => e.id === 'free-1')?.title;
-        if (!scenario || !title) {
-          await openMenu(bot, msg);
-          return;
-        }
-        await openScenario(bot, msg, scenario, title, msg.text, msg.text);
-        return;
-      }
-      case 'no-practice':
-        if (session) forget(session);
-        await replyText(bot, msg, null, '现在没有进行中的练习。回个数字选场景，或者直接发一条语音。');
-        return;
-      case 'review': {
-        if (!session) return;
-        session.endedAt = new Date().toISOString();
-        session.endReason = 'user_end';
-        const card = buildReview(session);
-        await writeMeta(session);
-        await replyText(bot, msg, session, card);
-        return;
-      }
-      case 'start':
-        await openScenario(bot, msg, picked!.scenario, picked!.title, msg.text);
-        return;
-      case 'menu':
+  switch (action) {
+    case 'note-ended':
+      await replyText(bot, msg, session, ENDED_TEXT);
+      return;
+    case 'restart':
+      if (session) forget(session);
+      await openScenario(bot, msg, picked!.scenario, picked!.title, msg.text);
+      return;
+    case 'start-seed': {
+      const cat = await catalog();
+      const scenario = cat.byId.get('free-1');
+      const title = cat.index.find((e) => e.id === 'free-1')?.title;
+      if (!scenario || !title) {
         await openMenu(bot, msg);
         return;
-      case 'choose':
-        if (!session || !picked) return;
-        await chooseScenario(bot, session, msg, picked.scenario, picked.title);
-        return;
-      case 'repeat-menu':
-        await replyText(bot, msg, session, renderMenu((await catalog()).index));
-        return;
-      case 'need-voice':
-        await replyText(bot, msg, session, '准备好了就发一条语音。');
-        return;
-      case 'live-text':
-        await replyText(bot, msg, session, '直接发语音就行，我们练口语。发 /end 结束这次练习。');
-        return;
-      default:
-        return;
+      }
+      await openScenario(bot, msg, scenario, title, msg.text, msg.text);
+      return;
     }
-  });
+    case 'no-practice':
+      if (session) forget(session);
+      await replyText(bot, msg, null, '现在没有进行中的练习。回个数字选场景，或者直接发一条语音。');
+      return;
+    case 'review': {
+      if (!session) return;
+      session.endedAt = new Date().toISOString();
+      session.endReason = 'user_end';
+      const card = buildReview(session);
+      await writeMeta(session);
+      await replyText(bot, msg, session, card);
+      return;
+    }
+    case 'start':
+      await openScenario(bot, msg, picked!.scenario, picked!.title, msg.text);
+      return;
+    case 'menu':
+      await openMenu(bot, msg);
+      return;
+    case 'choose':
+      if (!session || !picked) return;
+      await chooseScenario(bot, session, msg, picked.scenario, picked.title);
+      return;
+    case 'repeat-menu':
+      await replyText(bot, msg, session, renderMenu((await catalog()).index));
+      return;
+    case 'need-voice':
+      await replyText(bot, msg, session, '准备好了就发一条语音。');
+      return;
+    case 'live-text':
+      await replyText(bot, msg, session, '直接发语音就行，我们练口语。发 /end 结束这次练习。');
+      return;
+    default:
+      return;
+  }
 }
 
 async function handleAudio(bot: ReturnType<typeof startBot>, msg: IncomingVoice) {
-  const prepared = await withChatLock(msg.chatId, async () => {
-    const session = findSession(msg);
-    if (session) remember(session, msg);
-    const action = nextAction(flowOf(session), { kind: 'audio', alias: false, endCommand: false });
+  const session = findSession(msg);
+  if (session) remember(session, msg);
+  const action = nextAction(flowOf(session), { kind: 'audio', alias: false, endCommand: false });
 
-    if (action === 'audio-ended') {
-      await replyText(bot, msg, session, ENDED_TEXT);
-      return null;
-    }
-    if (action === 'audio-menu') {
-      await openMenu(bot, msg);
-      return null;
-    }
-    if (!session) return null;
-    if (action === 'audio-need-choice') {
-      await replyText(bot, msg, session, renderMenu((await catalog()).index));
-      return null;
-    }
-    return { session, warming: action === 'warmup' };
-  });
-  if (!prepared) return;
+  if (action === 'audio-ended') {
+    await replyText(bot, msg, session, ENDED_TEXT);
+    return;
+  }
+  if (action === 'audio-menu') {
+    await openMenu(bot, msg);
+    return;
+  }
+  if (!session) return;
+  if (action === 'audio-need-choice') {
+    await replyText(bot, msg, session, renderMenu((await catalog()).index));
+    return;
+  }
 
-  const { session, warming } = prepared;
+  const warming = action === 'warmup';
   const turnIndex = warming ? 0 : await nextTurnIndex(session.dir);
   const dir = warming ? warmupDir(session) : formalTurnDir(session, turnIndex);
   const turnLabel = warming ? 'warmup' : String(turnIndex);

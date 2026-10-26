@@ -49,8 +49,9 @@
 # 1. Node 依赖
 pnpm add @larksuiteoapi/node-sdk ffprobe-static zod dotenv
 
-# ffmpeg 用 vendor/ 里的二进制。ffmpeg-static 的 postinstall 要访问 GitHub，本机装不上：
-#   vendor/ffmpeg   vendor/ffprobe
+# ffmpeg 用 vendor/ 里的二进制：ffmpeg-static 的 postinstall 要访问 GitHub，本机装不上。
+#   vendor/ffmpeg
+# ffprobe 不用放：ffprobe-static 是普通 npm 包，装得上，且自带 arm64 原生二进制。
 
 # 2. Python ASR（注意锁 av 版本，否则装不上）
 python3 -m venv .venv
@@ -70,7 +71,7 @@ python3 -m venv .venv
 |---|---|
 | 语音 → 文本 | faster-whisper `small.en`（本地，带词级时间戳） |
 | 文本 → 语音 | MiniMax `speech-2.8-hd` / `English_Gentle-voiced_man` |
-| 转码 / 时长 | `vendor/ffmpeg` + `ffprobe-static` |
+| 转码 / 时长 | `vendor/ffmpeg`（只这一个）+ `ffprobe-static` |
 | 对话模型 | Moonshot `kimi-k2.6`（`thinking` 关掉） |
 | 飞书接入 | `@larksuiteoapi/node-sdk` WS 长连接 |
 
@@ -78,7 +79,7 @@ python3 -m venv .venv
 
 1. 开着思考的 Kimi（`kimi-k3`，以及没关思考的 `k2.6`）一次回复要十几秒。在线对话用 `kimi-k2.6` 且 `thinking.type=disabled`。`kimi-k2.7-code-highspeed` 关不掉思考，prompt 一长就会到 5–10 秒。
 2. `av` 必须锁 `15.1.0`，否则本机（macOS 13）装不上 faster-whisper。
-3. `-ar 16000` 对 opus 无效；读时长优先用 `vendor/ffprobe`，装不上才退回 `ffmpeg -i` 解析 `Duration:` 行。
+3. `-ar 16000` 对 opus 无效；读时长用 `ffprobe-static`，读不到才退回 `ffmpeg -i` 解析 `Duration:` 行。
 
 ---
 
