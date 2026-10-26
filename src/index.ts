@@ -39,6 +39,8 @@ import { anchorId, lookupKeys, primaryKey, replyInThread, sessionKey } from './t
 type Catalog = {
   index: IndexEntry[];
   byId: Map<string, ResolvedScenario>;
+  /** 校验没过但仍然可用的场景。恢复存量 session 时要区分「有配置错」和「文件没了」 */
+  problems: Record<string, string[]>;
 };
 
 let cached: Catalog | null = null;
@@ -54,6 +56,7 @@ async function catalog(): Promise<Catalog> {
   cached = {
     index,
     byId: new Map(scenarios.filter((s) => !problems[s.id]).map((s) => [s.id, resolveScenario(s)])),
+    problems,
   };
   return cached;
 }
@@ -135,16 +138,62 @@ function isEndCommand(text: string): boolean {
 
 const ENDED_TEXT = '这次练习结束了，开个新话题继续。';
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 把这一轮的回复送到用户手上。**任何一步失败都不能让回复无声消失。**
+ *
+ * 为什么不能只是「失败了就 throw」（#1）：这一轮此时已经 `persistTurn` 落盘、
+ * 也已经 push 进 `session.turns`。用户没听到，但下一轮的对话历史里已经有这条
+ * assistant 发言了 —— 用户会以为自己漏听了一句，而且这一轮的分析还会进复盘卡片。
+ *
+ * 三级兜底，从「最好的」到「至少能看懂」：
+ * 1. 语音正常发（绝大多数情况）
+ * 2. 语音重试 3 次，间隔递增（飞书 5xx / 上传抖动）
+ * 3. 还是不行就发文字（04 §七 明确允许：故障兜底时发文字）
+ *
+ * 只有三级全失败才抛错，交给调用方提示用户。
+ */
 async function sendVoice(bot: ReturnType<typeof startBot>, msg: IncomingVoice, session: Session, say: string) {
-  const audio = await speakTurn(session, say);
-  try {
-    const sent = await bot.sendOpus(targetOf(msg), audio.path, audio.durationMs);
+  const target = targetOf(msg);
+
+  const rememberSent = async (sent: SentMessage) => {
     const learned = (!session.threadId && sent.threadId) || (!session.rootId && sent.rootId);
     adopt(session, sent);
     if (learned) await writeMeta(session);
-  } finally {
-    await rm(audio.dir, { recursive: true, force: true }).catch(() => {});
+  };
+
+  // ① TTS。失败也不是终点 —— 直接跳到文字兜底，语音合成挂了但话还是要说。
+  let audio: Awaited<ReturnType<typeof speakTurn>> | null = null;
+  try {
+    audio = await speakTurn(session, say);
+  } catch (err) {
+    console.error('[tts]', err instanceof Error ? err.message : err);
   }
+
+  if (audio) {
+    try {
+      // ② 语音发送，最多 3 次
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await rememberSent(await bot.sendOpus(target, audio.path, audio.durationMs));
+          return;
+        } catch (err) {
+          const last = attempt === 3;
+          console.error(
+            `[sendOpus] 第 ${attempt} 次失败${last ? '，改发文字' : '，重试'}`,
+            err instanceof Error ? err.message : err
+          );
+          if (!last) await sleep(attempt * 400);
+        }
+      }
+    } finally {
+      await rm(audio.dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  // ③ 文字兜底。这一条也失败才算真失败，让调用方提示用户。
+  await rememberSent(await bot.sendText(target, say));
 }
 
 function topicFields(msg: IncomingVoice) {
@@ -368,11 +417,18 @@ async function main() {
   const { appId, appSecret } = envCredentials();
   const cat = await catalog();
   console.log(`场景：${[...cat.byId.keys()].join(', ') || '(无)'}`);
-  const restored = await restoreOpenSessions(SESSIONS_ROOT, (id) => {
+  // 校验没过的场景也照常恢复：配置改错一个字不该让用户正在进行的练习凭空消失（#4）。
+  // 只有文件真的不在了才放弃，且放弃时要通知用户。
+  const { open: restored, orphaned } = await restoreOpenSessions(SESSIONS_ROOT, (id) => {
     const scenario = cat.byId.get(id);
-    if (!scenario) return null;
-    const listTitle = cat.index.find((e) => e.id === id)?.title ?? scenario.title;
-    return { scenario, listTitle };
+    const problem = cat.problems[id];
+    const listTitle = cat.index.find((e) => e.id === id)?.title ?? scenario?.title ?? id;
+    if (scenario) {
+      return problem
+        ? { kind: 'degraded', scenario, listTitle, problem: problem.join('；') }
+        : { kind: 'ok', scenario, listTitle };
+    }
+    return { kind: 'missing', scenarioId: id };
   });
   for (const session of restored) rememberRestored(session);
   if (restored.length) console.log(`恢复 ${restored.length} 场未结束的练习`);
@@ -382,6 +438,28 @@ async function main() {
     appSecret,
     onMessage: (msg) => handleVoice(bot, msg),
   });
+
+  // 场景文件没了的那些场次，主动告诉用户一声。
+  // 不通知的话用户会对着一个永无回应的对话框继续说，而那是这一条要修的东西（#4）。
+  for (const orphan of orphaned) {
+    const text =
+      `这场练习（${orphan.scenarioTitle || orphan.scenarioId}）的场景配置不在了，接不下去。` +
+      '开个新话题重新开始吧。';
+    const sent = orphan.anchorMessageId
+      ? await bot
+          .sendText(
+            {
+              chatId: orphan.chatId,
+              anchorMessageId: orphan.anchorMessageId,
+              inThread: !!orphan.threadId,
+            },
+            text
+          )
+          .catch(() => null)
+      : null;
+    if (!sent) await bot.postText(orphan.chatId, text).catch((err) => console.error('[orphan]', err));
+  }
+  if (orphaned.length) console.log(`已通知 ${orphaned.length} 场无法恢复的练习`);
 
   const identity = await bot.getIdentity().catch(() => ({ openId: '', name: '' }));
   console.log(`已连接：${identity.name || '(未知 bot)'}`);

@@ -237,22 +237,47 @@ async function readTurns(dir: string): Promise<{ warmup: Turn | null; turns: Tur
 }
 
 /**
+ * 恢复时查场景。三种结果必须分开，因为处理方式完全不同：
+ *
+ * - `ok`：正常
+ * - `degraded`：**文件能解析，只是内容校验没过**。这种必须照常恢复 ——
+ *   配置里改错一个字不该让用户正在进行的一场练习凭空消失（#4）。
+ *   运行时会 warn，但流程走完这一场。
+ * - `missing`：文件真的不在了。恢复不了，但也要让用户知道，不能静默。
+ */
+export type ScenarioLookup =
+  | { kind: 'ok'; scenario: ResolvedScenario; listTitle: string }
+  | { kind: 'degraded'; scenario: ResolvedScenario; listTitle: string; problem: string }
+  | { kind: 'missing'; scenarioId: string };
+
+/** 恢复不了一场时，把「该通知谁」的信息带出来，交给调用方发一句说明 */
+export type OrphanedSession = {
+  sessionId: string;
+  chatId: string;
+  anchorMessageId: string | null;
+  threadId: string | null;
+  rootId: string | null;
+  scenarioId: string;
+  scenarioTitle: string | null;
+  reason: string;
+};
+
+/**
  * 启动时扫 meta.json。endedAt === null 的装回内存。
  * 旧档没有 sessionKey / endedAt 的直接跳过，不把已经结束的练习复活。
  */
 export async function restoreOpenSessions(
   root: string,
-  resolveScenarioById: (
-    scenarioId: string
-  ) => { scenario: ResolvedScenario; listTitle: string } | null
-): Promise<Session[]> {
+  lookup: (scenarioId: string) => ScenarioLookup
+): Promise<{ open: Session[]; orphaned: OrphanedSession[] }> {
   let days: string[] = [];
   try {
     days = await readdir(root);
   } catch {
-    return [];
+    return { open: [], orphaned: [] };
   }
   const open: Session[] = [];
+  const orphaned: OrphanedSession[] = [];
   let skipped = 0;
   for (const day of days) {
     let ids: string[] = [];
@@ -283,11 +308,27 @@ export async function restoreOpenSessions(
       let scenario: ResolvedScenario | null = null;
       let listTitle: string | null = null;
       if (meta.scenarioId) {
-        const hit = resolveScenarioById(meta.scenarioId);
-        if (!hit) {
-          console.warn(`[session] ${meta.sessionId} 的场景 ${meta.scenarioId} 加载不到，跳过`);
-          skipped++;
+        const hit = lookup(meta.scenarioId);
+        if (hit.kind === 'missing') {
+          // 文件真的不在了。恢复不了，但要让用户收到一句说明（#4）
+          console.error(`[session] ${meta.sessionId} 的场景 ${meta.scenarioId} 文件不存在，无法恢复`);
+          orphaned.push({
+            sessionId: meta.sessionId,
+            chatId: meta.chatId,
+            anchorMessageId: meta.anchorMessageId,
+            threadId: meta.threadId,
+            rootId: meta.rootId,
+            scenarioId: meta.scenarioId,
+            scenarioTitle: meta.scenarioTitle,
+            reason: 'missing',
+          });
           continue;
+        }
+        if (hit.kind === 'degraded') {
+          // 配置有错但能跑。照常恢复，warn 出来让人去修，别让练习消失（#4）
+          console.warn(
+            `[session] ${meta.sessionId} 的场景 ${meta.scenarioId} 校验没过，仍然恢复：${hit.problem}`
+          );
         }
         scenario = hit.scenario;
         listTitle = hit.listTitle;
@@ -317,7 +358,8 @@ export async function restoreOpenSessions(
     }
   }
   if (skipped) console.log(`[session] 扫盘跳过 ${skipped} 份对不上的 meta`);
-  return open;
+  if (orphaned.length) console.warn(`[session] ${orphaned.length} 场练习因场景缺失无法恢复，会通知用户`);
+  return { open, orphaned };
 }
 
 export async function attachScenario(
@@ -394,6 +436,27 @@ async function persistTurn(turnDir: string, record: Turn, asrResult: unknown, tr
   await writeFile(join(turnDir, 'metrics.json'), JSON.stringify(trace.metrics ?? null, null, 2), 'utf8');
 }
 
+/**
+ * 把一轮作废的轮次从 `turns/<编号>` 挪走，改名成 `turns/missed-<名字>-<时间戳>`。
+ *
+ * 两个作用，对应两个真实存在的问题：
+ * 1. **不让编号被吃掉**。`nextTurnIndex` 只认 `^\d{3}$`，`001` 一旦留下空壳，
+ *    下一轮就变成 002，编号里出现一个谁都看不懂的洞。
+ * 2. **不静默丢证据**。ASR 没听清时音频还在，改名之后 `readTurns` 不会读它
+ *    （它只认 `000-warmup` 和三位数字），但盘上留着，可以事后查为什么没听清。
+ *
+ * 改名失败不影响主流程——最坏情况是留个空目录，比让这一轮整个失败好。
+ */
+async function quarantineTurnDir(turnDir: string, label: string): Promise<void> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = join(turnDir, '..', `missed-${label}-${stamp}`);
+  try {
+    await rename(turnDir, target);
+  } catch (err) {
+    console.warn(`[session] 作废轮次改名失败 ${turnDir}`, err instanceof Error ? err.message : err);
+  }
+}
+
 function requireScenario(session: Session): ResolvedScenario {
   if (!session.scenario) throw new Error('还没选场景');
   return session.scenario;
@@ -424,6 +487,12 @@ export async function runWarmup(params: {
 
   if (!text) {
     trace.missed = true;
+    // 也要落盘：不落盘的话用户连说三次都没反应，而盘上一个字节都没有，
+    // 事后完全查不出是 ASR 空结果、还是音频本身有问题（#2）。
+    // 落完再改名移走，否则 `000-warmup` 会留着让 `readTurns` 读到一个空轮次。
+    const record: Turn = { index: 0, userText: '', words: asrResult.words, reply: { say: '', flags: [] } };
+    await persistTurn(turnDir, record, asrResult, trace);
+    await quarantineTurnDir(turnDir, 'warmup');
     return {
       say: "Sorry, I didn't catch that. Could you say it again?",
       flags: [],
@@ -479,6 +548,12 @@ export async function runTurn(params: {
   const text = asrResult.text.trim() || userText.trim();
   if (!text) {
     trace.missed = true;
+    // 和热身同一套处理：先落盘留证据，再改名移走不留空壳。
+    // 这一轮**不进 `session.turns`**——模块级的坑在于编号已经用掉，
+    // 而 `turns/001` 里没有 asr.json / llm.json，下次扫盘会 warn「坏轮次」（#3）。
+    const record: Turn = { index, userText: '', words: asrResult.words, reply: { say: '', flags: [] } };
+    await persistTurn(turnDir, record, asrResult, trace);
+    await quarantineTurnDir(turnDir, String(index));
     return {
       say: "Sorry, I didn't catch that. Could you say it again?",
       flags: [],

@@ -504,14 +504,44 @@ try {
   await mkdir(oldDir, { recursive: true });
   await writeFile(join(oldDir, 'meta.json'), JSON.stringify({ sessionId: 'old', chatId: 'oc_r' }));
 
-  const found = await restoreOpenSessions(scratch, (id) =>
-    id === 'cafe-1' ? { scenario: cafe, listTitle: '点单 · 店员会听错一次' } : null
+  const { open: found, orphaned } = await restoreOpenSessions(scratch, (id) =>
+    id === 'cafe-1'
+      ? { kind: 'ok', scenario: cafe, listTitle: '点单 · 店员会听错一次' }
+      : { kind: 'missing', scenarioId: id }
   );
   eq('只恢复未结束的一场', found.map((s) => s.id), ['20261025-0000-open']);
   eq('轮次从盘上读回来', found[0]?.turns.map((t) => t.userText), ['to go']);
   eq('热身也读回来', found[0]?.warmup?.userText, 'Could I get a medium latte');
   eq('场景接回来', found[0]?.scenario?.id, 'cafe-1');
   eq('空目录的下一轮是 2', await nextTurnIndex(openDir), 2);
+
+  // 场景文件不在了：不恢复，但要留下能通知用户的记录，不能静默
+  const missingDir = join(scratch, '2026-10-25', '20261025-0000-gone');
+  await mkdir(join(missingDir, 'turns'), { recursive: true });
+  await writeFile(
+    join(missingDir, 'meta.json'),
+    JSON.stringify({ ...meta, sessionId: '20261025-0000-gone', scenarioId: 'retired-1', scenarioTitle: '退货' })
+  );
+  // 只让 retired-1 缺失，cafe-1 正常，这样这个用例只测「缺失」这一件事
+  const gone = await restoreOpenSessions(scratch, (id) =>
+    id === 'cafe-1'
+      ? { kind: 'ok', scenario: cafe, listTitle: '点单' }
+      : { kind: 'missing', scenarioId: id }
+  );
+  eq('只把场景缺失的那场挑出来', gone.orphaned.map((o) => o.sessionId), ['20261025-0000-gone']);
+  eq('场景文件没了就不恢复它', gone.open.map((s) => s.id), ['20261025-0000-open']);
+  eq('但要记下来通知谁', gone.orphaned.map((o) => o.chatId), [meta.chatId]);
+  eq('通知要用锚点消息', gone.orphaned[0]?.anchorMessageId, 'om_r');
+  eq('通知要带上场景名', gone.orphaned[0]?.scenarioTitle, '退货');
+
+  // 场景只是校验没过：照常恢复，配置里的错不能吃掉用户的练习
+  const degraded = await restoreOpenSessions(scratch, (id) =>
+    id === 'cafe-1'
+      ? { kind: 'degraded', scenario: cafe, listTitle: '点单', problem: '块数必须为 3' }
+      : { kind: 'missing', scenarioId: id }
+  );
+  eq('校验没过的场景仍然恢复', degraded.open.map((s) => s.id), ['20261025-0000-open']);
+  eq('恢复后场景仍然可用', degraded.open[0]?.scenario?.id, 'cafe-1');
 } finally {
   await rm(scratch, { recursive: true, force: true });
 }
